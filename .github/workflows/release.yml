@@ -13,12 +13,16 @@ jobs:
         include:
           - os: windows-latest
             platform_suffix: Windows_x64
+            py_ver: '3.10'
           - os: windows-11-arm
             platform_suffix: Windows_ARM64
+            py_ver: '3.11'  # 升级此处的Python版本，完美解决ARM64找不到3.10的Bug
           - os: macos-latest
             platform_suffix: macOS_ARM64
+            py_ver: '3.10'
           - os: macos-15-intel
             platform_suffix: macOS_Intel
+            py_ver: '3.10'
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -33,7 +37,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ matrix.py_ver }}
 
       - name: Install dependencies
         run: pip install -r requirements.txt
