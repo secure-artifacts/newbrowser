@@ -57,9 +57,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
+          # 【核心修改】将编译出来的软件名称直接改为中文
+          pyinstaller -F -w browser_Gui.py --name 浏览器痕迹分析 --clean --noconfirm
           
-          # 智能命名逻辑：主按钮产物加中文前缀，下拉菜单产物保持简洁
           if ('${{ matrix.is_main }}' -eq 'true') {
               $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           } else {
@@ -69,13 +69,14 @@ jobs:
           $targetPath = "dist_final/$folderName"
           New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
           
-          Copy-Item dist/BrowserAudit.exe $targetPath/
+          # 【核心修改】复制中文命名的 .exe 文件
+          Copy-Item dist/浏览器痕迹分析.exe $targetPath/
           
-          # 动态提取本地的真实全量规则库
           if (Test-Path "custom-domains.conf") {
               Copy-Item "custom-domains.conf" $targetPath/
           } else {
-              Write-Host "警告: 未检测到 custom-domains.conf 文件！"
+              Write-Host "错误: 未在仓库根目录检测到 custom-domains.conf 文件！"
+              exit 1
           }
           
           Compress-Archive -Path $targetPath -DestinationPath "dist_final/${folderName}.zip" -Force
@@ -83,7 +84,8 @@ jobs:
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
+          # 【核心修改】将编译出来的 Mac 应用名称直接改为中文
+          pyinstaller --onedir --windowed --name 浏览器痕迹分析 browser_Gui.py --clean --noconfirm
           
           if [ "${{ matrix.is_main }}" == "true" ]; then
               folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
@@ -92,12 +94,14 @@ jobs:
           fi
           
           mkdir -p "dist_final/${folder_name}"
-          cp -r dist/BrowserAudit.app "dist_final/${folder_name}/"
+          # 【核心修改】复制中文命名的 .app 目录
+          cp -r dist/浏览器痕迹分析.app "dist_final/${folder_name}/"
           
           if [ -f "custom-domains.conf" ]; then
               cp "custom-domains.conf" "dist_final/${folder_name}/"
           else
-              echo "警告: 未检测到 custom-domains.conf 文件!"
+              echo "错误: 未在仓库根目录检测到 custom-domains.conf 文件!"
+              exit 1
           fi
           
           cd dist_final && zip -r "${folder_name}.zip" "${folder_name}"
