@@ -3,16 +3,28 @@ name: Build and Release with Attestation
 on:
   push:
     tags:
-      - 'v*' # 当你推送形如 v1.0.0 的 tag 时触发构建
-
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+      - 'v*'
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest # 必须是 github-hosted 环境
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform_suffix: Windows_x64
+          - os: windows-11-arm
+            platform_suffix: Windows_ARM64
+          - os: macos-latest
+            platform_suffix: macOS_ARM64
+          - os: macos-15-intel
+            platform_suffix: macOS_Intel
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
 
     steps:
       - name: Checkout code
@@ -21,29 +33,66 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-with-version: '3.10'
+          python-version: '3.10'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pyinstaller
+        run: pip install -r requirements.txt
 
-      - name: Packaging Application
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          # 模拟打包流程，生成分发归档包
-          mkdir dist
-          tar -czf dist/newbrowser-source.tar.gz src/ requirements.txt
+          pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
+          New-Item -ItemType Directory -Force -Path dist_final | Out-Null
+          Copy-Item dist/BrowserAudit.exe dist_final/
+          @"
+          # 专项审计规则库 (自定义扩展)
+          heygen.com=AI视频(HeyGen)
+          hailuoai.com=AI服务(海螺AI)
+          "@ | Out-File -Encoding utf8 dist_final/custom-domains.conf
+          $zip = "newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip"
+          Compress-Archive -Path dist_final/* -DestinationPath $zip -Force
 
-      - name: Generate GitHub Release
-        id: create_release
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
+          mkdir -p dist_final
+          cp -r dist/BrowserAudit.app dist_final/
+          cat > dist_final/custom-domains.conf << 'EOF'
+          # 专项审计规则库 (自定义扩展)
+          heygen.com=AI视频(HeyGen)
+          hailuoai.com=AI服务(海螺AI)
+          EOF
+          zip_name="newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip"
+          cd dist_final && zip -r "../${zip_name}" BrowserAudit.app custom-domains.conf
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform_suffix }}
+          path: newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/newbrowser-source.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Attest Build Artifacts
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-path: 'dist/newbrowser-source.tar.gz'
+          files: artifacts/*
+          generate_release_notes: true
