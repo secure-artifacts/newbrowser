@@ -11,21 +11,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 对应前端 Windows 大按钮
+          # 1. 精准命中：前端 Windows 大按钮（最常用普通 64 位电脑，防止下错包）
           - os: windows-latest
             platform_suffix: Windows_x64普通电脑版
             py_ver: '3.10'
-          # 2. 伪装成 Linux 关键字，强行逼前端多生成一个独立的 Windows ARM 按钮
+
+          # 2. 安全隐藏：Windows 骁龙本（极少数人买，去掉全称隐藏到后台，绝不抢占前台按钮）
           - os: windows-11-arm
-            platform_suffix: Linux_Windows_ARM64骁龙本
+            platform_suffix: Win_ARM64
             py_ver: '3.11'
-          # 3. 对应前端 macOS 大按钮
+
+          # 3. 精准命中：前端 macOS 大按钮（M1/M2/M3/M4 等新款苹果 M 芯片用户）
           - os: macos-latest
             platform_suffix: macOS_ARM64_M芯片新款
             py_ver: '3.10'
-          # 4. 利用特殊的包含逻辑，尝试平铺或通过后台安全兜底
+
+          # 4. 降维打击：伪装成 Linux 关键字，强行逼前端为“老款 Intel Mac”多生成第三个独立大按钮！
           - os: macos-15-intel
-            platform_suffix: macOS_Intel老款电脑
+            platform_suffix: Linux_macOS_Intel老款电脑版
             py_ver: '3.10'
 
     runs-on: ${{ matrix.os }}
