@@ -11,24 +11,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 对应前端 Windows 大按钮（最常用普通 64 位电脑版）
+          # 1. 对应前端 Windows 大按钮
           - os: windows-latest
-            platform_suffix: Windows_x64_普通电脑版
+            is_main: 'true'
+            os_label: Windows_x64_普通电脑版
             py_ver: '3.10'
 
-          # 2. 优雅避让：不抢占大按钮，完美、齐全地显示在【其他产物】下拉菜单
+          # 2. 优雅避让，完美掉进【其他产物】下拉菜单
           - os: windows-11-arm
-            platform_suffix: Win_ARM64_高通骁龙本专用包
+            is_main: 'false'
+            os_label: Win_ARM64_高通骁龙本专用包
             py_ver: '3.11'
 
-          # 3. 对应前端 macOS 大按钮（M1/M2/M3/M4 等新款苹果 M 芯片用户）
+          # 3. 对应前端 macOS 大按钮
           - os: macos-latest
-            platform_suffix: macOS_ARM64_M芯片新款
+            is_main: 'true'
+            os_label: macOS_M芯片新款
             py_ver: '3.10'
 
-          # 4. 优雅避让：不抢占大按钮，完美、齐全地显示在【其他产物】下拉菜单
+          # 4. 优雅避让，完美掉进【其他产物】下拉菜单
           - os: macos-15-intel
-            platform_suffix: Mac_Intel_老款电脑专用包
+            is_main: 'false'
+            os_label: Mac_Intel_老款电脑专用包
             py_ver: '3.10'
 
     runs-on: ${{ matrix.os }}
@@ -54,40 +58,60 @@ jobs:
         shell: pwsh
         run: |
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
-          New-Item -ItemType Directory -Force -Path dist_final | Out-Null
-          Copy-Item dist/BrowserAudit.exe dist_final/
-          @"
-          # 专项审计规则库 (自定义扩展)
-          heygen.com=AI视频(HeyGen)
-          hailuoai.com=AI服务(海螺AI)
-          "@ | Out-File -Encoding utf8 dist_final/custom-domains.conf
-          $zip = "newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip"
-          Compress-Archive -Path dist_final/* -DestinationPath $zip -Force
+          
+          # 智能命名逻辑：主按钮产物加中文前缀，下拉菜单产物保持简洁
+          if ('${{ matrix.is_main }}' -eq 'true') {
+              $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
+          } else {
+              $folderName = "${{ matrix.os_label }}"
+          }
+          
+          $targetPath = "dist_final/$folderName"
+          New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
+          
+          Copy-Item dist/BrowserAudit.exe $targetPath/
+          
+          # 动态提取本地的真实全量规则库
+          if (Test-Path "custom-domains.conf") {
+              Copy-Item "custom-domains.conf" $targetPath/
+          } else {
+              Write-Host "警告: 未检测到 custom-domains.conf 文件！"
+          }
+          
+          Compress-Archive -Path $targetPath -DestinationPath "dist_final/${folderName}.zip" -Force
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
           pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
-          mkdir -p dist_final
-          cp -r dist/BrowserAudit.app dist_final/
-          cat > dist_final/custom-domains.conf << 'EOF'
-          # 专项审计规则库 (自定义扩展)
-          heygen.com=AI视频(HeyGen)
-          hailuoai.com=AI服务(海螺AI)
-          EOF
-          zip_name="newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip"
-          cd dist_final && zip -r "../${zip_name}" BrowserAudit.app custom-domains.conf
+          
+          if [ "${{ matrix.is_main }}" == "true" ]; then
+              folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
+          else
+              folder_name="${{ matrix.os_label }}"
+          fi
+          
+          mkdir -p "dist_final/${folder_name}"
+          cp -r dist/BrowserAudit.app "dist_final/${folder_name}/"
+          
+          if [ -f "custom-domains.conf" ]; then
+              cp "custom-domains.conf" "dist_final/${folder_name}/"
+          else
+              echo "警告: 未检测到 custom-domains.conf 文件!"
+          fi
+          
+          cd dist_final && zip -r "${folder_name}.zip" "${folder_name}"
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip
+          subject-path: dist_final/*.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform_suffix }}
-          path: newbrowser-${{ github.ref_name }}-${{ matrix.platform_suffix }}.zip
+          name: ${{ matrix.os_label }}
+          path: dist_final/*.zip
 
   release:
     needs: build
