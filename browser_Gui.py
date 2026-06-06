@@ -61,7 +61,20 @@ class ResourceManager:
                     "# 专项规则库 (自定义扩展)\n"
                     "heygen.com=AI视频(HeyGen)\n"
                     "hailuoai.com=AI服务(海螺AI)\n"
-                    "gemini.google.com=AI服务(Gemini)\n"
+                    "mailum.com=未知安全邮箱\n"
+                    "tongyi.aliyun.com=AI服务(阿里通义)\n"
+                    "doubao.com=AI服务(字节豆包)\n"
+                    "yuanbao.tencent.com=AI服务(腾讯元宝)\n"
+                    "yiyan.baidu.com=AI服务(文心一言)\n"
+                    "tiangong.cn=AI服务(昆仑天工)\n"
+                    "kimi.ai=AI服务(月暗Kimi)\n"
+                    "deepseek.com=AI服务(DeepSeek)\n"
+                    "chatglm.cn=AI服务(智谱清言)\n"
+                    "baichuan-ai.com=AI服务(百川智能)\n"
+                    "minimax.chat=AI服务(MiniMax星野)\n"
+                    "klingai.com=AI视频(快手可灵)\n"
+                    "viggle.ai=AI视频(Viggle动画)\n"
+                    "shengxiang.baidu.com=AI视频(百度生息)\n"
                     "server=/dreamina.capcut.com/114.114.114.114\n",
                     encoding="utf-8"
                 )
@@ -90,7 +103,7 @@ class ResourceManager:
                     for b in browsers:
                         if b not in running:
                             if proc_name == b or proc_name.startswith(f"{b}."):
-                                running.append(b)
+                                        running.append(b)
         except Exception as e:
             logger.debug(f"进程检测异常: {e}")
         return running
@@ -395,16 +408,17 @@ class ScannerCore:
             
             parts = domain.split('.')
             
-            # 规则控制逻辑：精确规则强优先，确保 gemini.google.com 等目标不被白名单错杀
+            # 🔥【第一優先防線：白名單強效過濾】
+            # 優先比對白名單（例如 google.com 等），命中即直接跳過，防止被後面模糊或錯位的自訂規則攔截
+            for i in range(len(parts)):
+                if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
+                    return 
+
+            # 🛡️【第二優先防線：專項審計規則比對】
             for i in range(len(parts)):
                 sub_domain = ".".join(parts[i:])
                 if "." in sub_domain and sub_domain in rule_dict:
                     hits.append((profile["b"], profile["p"], info_type, rule_dict[sub_domain], url))
-                    return 
-
-            # 未命中任何审计规则，最后交由全局白名单过滤
-            for i in range(len(parts)):
-                if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
                     return 
 
         except Exception:
@@ -530,7 +544,7 @@ class App(tk.Tk):
         total_count = len(unique_hits)
         
         html_content = [
-            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>浏览器痕迹分析报告</title>',
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>浏览器痕迹 analysis 报告</title>',
             '<style>body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:25px;background-color:#f5f7fa;}.container{max-width:1500px;margin:auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}h1{color:#2c3e50;text-align:center;border-bottom:2px solid #1890ff;padding-bottom:15px;margin-top:0;font-size:24px;}.summary{font-size:14px;color:#555;margin-bottom:20px;display:flex;justify-content:space-between;background:#e6f7ff;padding:12px 20px;border-radius:4px;border-left:4px solid #1890ff;}.highlight{color:#ff4d4f;font-weight:bold;font-size:16px;}table{width:100%;border-collapse:collapse;table-layout:fixed;box-shadow:0 1px 3px rgba(0,0,0,0.02);}th:nth-child(1),td:nth-child(1){width:10%;text-align:center;}th:nth-child(2),td:nth-child(2){width:12%;text-align:center;}th:nth-child(3),td:nth-child(3){width:10%;text-align:center;}th:nth-child(4),td:nth-child(4){width:13%;text-align:center;}th:nth-child(5),td:nth-child(5){width:55%;}th,td{padding:0 12px;height:38px;line-height:38px;border-bottom:1px solid #f0f0f0;font-size:13px;}th{background-color:#1890ff;color:white;font-weight:600;}tr:hover{background-color:#fafafa;}.url-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}a{color:#1890ff;text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}a:hover{color:#40a9ff;text-decoration:underline;}</style>',
             '</head><body><div class="container"><h1>🔍 浏览器痕迹分析报告</h1>',
             f'<div class="summary"><span>生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span><span>共计发现留痕记录：<span class="highlight">{total_count}</span> 条</span></div>',
