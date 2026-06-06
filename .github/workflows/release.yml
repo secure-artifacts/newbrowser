@@ -11,23 +11,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 包含 'windows' 关键词，100% 精准绑定左边 Windows 下载大按钮
+          # 1. 包含 'windows' 关键词，精准绑定左边 Windows 大按钮
           - os: windows-latest
             os_label: Windows_x64_普通电脑版
             asset_name: newbrowser-windows
 
-          # 2. 彻底剔除 'win' 字样，改用最标准、无冲突的 'arm64'，100% 自动掉进“其他产物”
+          # 2. 彻底剔除 'win' 字样，改用 'arm64'，触发下拉菜单
           - os: windows-latest
             os_label: Win_ARM64_高通骁龙本专用包
             asset_name: newbrowser-arm64
 
-          # 3. 包含 'macos' 关键词，100% 精准绑定右边 macOS 下载大按钮
+          # 3. 包含 'macos' 关键词，精准绑定右边 macOS 大按钮
           - os: macos-latest
             os_label: macOS_M芯片新款
             asset_name: newbrowser-macos
 
-          # 4. 彻底剔除 'mac' 字样，改用最标准、无冲突的 'intel'，100% 自动掉进“其他产物”
-          - os: macos-13
+          # 4. 彻底剔除 'mac' 字样，改用 'intel'，触发下拉菜单。
+          # 核心优化：os 改为 macos-latest，彻底解决排队卡死问题！
+          - os: macos-latest
             os_label: Mac_Intel_老款电脑专用包
             asset_name: newbrowser-intel
 
@@ -56,7 +57,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
           
-          # 内部解压出来的文件夹和程序名称依然保持你最完美的纯中文
           $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           $stage = "dist_final/$folderName"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -64,13 +64,17 @@ jobs:
           Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
           Copy-Item "custom-domains.conf" "$stage/" -Force
           
-          # 外部压缩包文件名采用隔离匹配的专属资产名
           Compress-Archive -Path $stage -DestinationPath "dist_final/${{ matrix.asset_name }}-${{ github.ref_name }}.zip" -Force
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
+          # 动态判断：如果是 Intel 任务，强制在 M 芯片服务器上生成 x86_64 架构
+          if [ "${{ matrix.asset_name }}" == "newbrowser-intel" ]; then
+              pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --target-arch x86_64 --clean --noconfirm
+          else
+              pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
+          fi
           
           folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           stage="dist_final/${folder_name}"
