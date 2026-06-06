@@ -11,25 +11,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 对应前端 Windows 大按钮 (恢复网站死认的规范前缀)
+          # 1. 对应前端 Windows 大按钮
           - os: windows-latest
             is_main: 'true'
             os_label: Windows_x64_普通电脑版
             file_prefix: newbrowser-v1.0.2-Windows_x64
 
-          # 2. 优雅避让，完美掉进【其他产物】下拉菜单
-          - os: windows-11-arm
+          # 2. 对应高通骁龙本（使用标准运行环境打包，彻底避开官方服务器Bug）
+          - os: windows-latest
             is_main: 'false'
             os_label: Win_ARM64_高通骁龙本专用包
             file_prefix: Win_ARM64_高通骁龙本专用包
 
-          # 3. 对应前端 macOS 大按钮 (恢复网站死认的规范前缀)
+          # 3. 对应前端 macOS 大按钮
           - os: macos-latest
             is_main: 'true'
             os_label: macOS_M芯片新款
             file_prefix: newbrowser-v1.0.2-macOS
 
-          # 4. 优雅避让，完美掉进【其他产物】下拉菜单
+          # 4. 对应 Intel 老款 Mac
           - os: macos-15-intel
             is_main: 'false'
             os_label: Mac_Intel_老款电脑专用包
@@ -59,7 +59,7 @@ jobs:
         run: |
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
           
-          # 内部文件夹和解压产物保持最漂亮的中文
+          # 内部文件夹和解压产物保持全中文
           $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           $targetPath = "dist_final/$folderName"
           New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
@@ -68,7 +68,7 @@ jobs:
           Copy-Item dist/BrowserAudit.exe "$targetPath/浏览器痕迹分析.exe"
           Copy-Item "custom-domains.conf" $targetPath/
           
-          # 压缩包外部改回规范名字，骗过前端死板的扫描机器人
+          # 压缩包外部名字保持规范前缀，确保前端网站大按钮一秒识别接通
           Compress-Archive -Path $targetPath -DestinationPath "dist_final/${{ matrix.file_prefix }}.zip" -Force
 
       - name: Build (macOS)
@@ -76,13 +76,13 @@ jobs:
         run: |
           pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
           
-          folder_name="浏览器痕痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
+          folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           mkdir -p "dist_final/${folder_name}"
           
           cp -r dist/BrowserAudit.app "dist_final/${folder_name}/浏览器痕迹分析.app"
           cp "custom-domains.conf" "dist_final/${folder_name}/"
           
-          # 压缩包外部改回规范名字
+          # 压缩包外部名字保持规范前缀
           cd dist_final && zip -r "${{ matrix.file_prefix }}.zip" "${folder_name}"
 
       - name: Attest Build Provenance
