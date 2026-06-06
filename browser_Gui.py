@@ -40,7 +40,10 @@ def get_base_directory() -> Path:
             exec_dir = Path(sys.executable).parent
             parent_dir = exec_dir.parent.parent.parent
             if "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir):
-                return Path.cwd()
+                # 【仅修改此处】：将 Path.cwd() 替换为用户家目录下的安全文件夹
+                safe_dir = Path.home() / ".browser_audit"
+                safe_dir.mkdir(parents=True, exist_ok=True)
+                return safe_dir
             return parent_dir
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
