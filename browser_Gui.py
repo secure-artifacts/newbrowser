@@ -23,7 +23,7 @@ from typing import List, Dict, Tuple, Optional
 # =================================================
 # 0. 全局配置与高级日志配置
 # =================================================
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,7 +131,7 @@ class ResourceManager:
         return rules
 
 # =================================================
-# 2. 扫描内核 (取证级架构重构)
+# 2. 扫描内核 (纯流式安全穿透架构)
 # =================================================
 class ScannerCore:
     GLOBAL_WHITE_SET = frozenset({
@@ -142,37 +142,30 @@ class ScannerCore:
     @staticmethod
     def _snapshot_database(db_path: Path, temp_dir: Path) -> Optional[Path]:
         """
-        👑 [绝杀修复1] 彻底废弃危险的 copy2，引入企业级 SQLite 原生 Backup API。
-        实现热备提取，绝对杜绝 WAL 竞态损坏和丢失，完美对抗高频读写。
+        👑 [终极洗牌修复] 废除所有可能引发跨平台强占式文件锁死锁的 backup API，
+        回归最纯粹、最稳健的二进制文件流分片读取，强制完成物理快照镜像隔离。
         """
         if not db_path.exists(): return None
         snap_name = f"audit_db_{time.time_ns()}.db"
         target_main_db = temp_dir / snap_name
         
         try:
-            # 采用超时锁策略，规避死锁
-            source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
-            dest = sqlite3.connect(str(target_main_db), timeout=10)
-            
-            with source, dest:
-                # 核心热备逻辑
-                source.backup(dest)
-                
-            source.close()
-            dest.close()
+            # 使用 'rb' 纯流式读取，在 Windows 和 Mac 底层都能直接绕过 SQLite 进程独占锁
+            with open(db_path, "rb") as f_in:
+                with open(target_main_db, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
             return target_main_db
-            
-        except sqlite3.OperationalError as e:
+        except IOError as e:
             msg = str(e).lower()
-            if "permission" in msg or "unable to open" in msg:
+            if "permission" in msg or "denied" in msg:
                 if "safari" in str(db_path).lower():
                     gui_warning_queue.put(("warning", f"【系统沙盒拦截】无法提取 Safari 数据库：\n{db_path.name}\n\n解决办法：请前往「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」，允许本程序。"))
                 logger.warning(f"【权限受限】{db_path.name} 拒绝访问。")
             else:
-                logger.error(f"热备 API 失败: {db_path.name} -> {e}")
+                logger.error(f"流式提取失败: {db_path.name} -> {e}")
             return None
         except Exception as e:
-            logger.error(f"热备引擎异常: {db_path.name} -> {e}")
+            logger.error(f"提取快照异常: {db_path.name} -> {e}")
             return None
 
     @staticmethod
@@ -247,7 +240,6 @@ class ScannerCore:
             if tmp_db:
                 conn = None
                 try:
-                    # 👑 [绝杀修复4] 增加 timeout，杜绝多核环境下的数据库死锁卡线程
                     conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=10)
                     cursor = conn.cursor()
                     cursor.execute("SELECT url FROM urls")
@@ -356,7 +348,6 @@ class ScannerCore:
                 try:
                     conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=10)
                     cursor = conn.cursor()
-                    # 👑 [绝杀修复3] 多版本 Safari Schema 的究极向下兼容
                     try: 
                         cursor.execute("SELECT DISTINCT history_items.url FROM history_items INNER JOIN history_visits ON history_items.id = history_visits.history_item")
                     except sqlite3.OperationalError: 
@@ -401,14 +392,14 @@ class ScannerCore:
             
             parts = domain.split('.')
             
-            # 规则强优先
+            # 规则控制逻辑：精确规则强优先，确保 gemini.google.com 等目标不被白名单错杀
             for i in range(len(parts)):
                 sub_domain = ".".join(parts[i:])
                 if "." in sub_domain and sub_domain in rule_dict:
                     hits.append((profile["b"], profile["p"], info_type, rule_dict[sub_domain], url))
                     return 
 
-            # 白名单兜底
+            # 未命中任何审计规则，最后交由全局白名单过滤
             for i in range(len(parts)):
                 if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
                     return 
@@ -428,7 +419,6 @@ class App(tk.Tk):
         
         self.all_hits = []
         self.current_report_path = None
-        # 👑 [绝杀修复8] 引入可中断标记，防止线程卡死无法退出
         self.is_scanning = False 
         
         ResourceManager.initialize()
@@ -489,7 +479,7 @@ class App(tk.Tk):
 
                 final_results = []
                 for i, p in enumerate(profiles):
-                    if not self.is_scanning: break # 检查中断信号
+                    if not self.is_scanning: break 
                     
                     self.queue.put(("msg", f"正在检索: {p['b']} -> {p['p']}"))
                     hits = ScannerCore.scan(p, rules, self.core_temp_dir)
@@ -525,11 +515,11 @@ class App(tk.Tk):
         file_name = f"Browser_Audit_Report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
         target_path = report_dir / file_name
         
-        # 👑 [绝杀修复6] 原子级联合主键去重，避免相同 URL 但行为不同被误杀
+        # 👑 原子级联合去重，避免相同 URL 但行为不同被误去重
         unique_hits = []
         seen = set()
         for h in self.all_hits:
-            key = (h[0], h[1], h[2], h[4]) # 浏览器 + Profile + 行为 + URL
+            key = (h[0], h[1], h[2], h[4]) 
             if key not in seen:
                 seen.add(key)
                 unique_hits.append(h)
@@ -616,7 +606,7 @@ class App(tk.Tk):
             self.after(100, self._process_queue)
 
     def on_exit(self):
-        self.is_scanning = False # 发送中断信号
+        self.is_scanning = False 
         try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
         except Exception: pass
         self.destroy()
