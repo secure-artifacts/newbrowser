@@ -37,12 +37,30 @@ gui_warning_queue = queue.Queue()
 def get_base_directory() -> Path:
     if getattr(sys, 'frozen', False):
         if sys.platform == 'darwin':
+            # exec_dir 对应 浏览器痕迹分析.app/Contents/MacOS
             exec_dir = Path(sys.executable).parent
-            parent_dir = exec_dir.parent.parent.parent
-            if "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir):
-                # 【仅修改此处】：将 Path.cwd() 替换为用户家目录下的安全文件夹
+            # .app 自身的绝对路径
+            app_path = exec_dir.parent.parent
+            # 获取 .app 所在的同级目录
+            parent_dir = app_path.parent
+            
+            # 检测方法：如果路径包含沙盒特征，或者同级目录下的配置文件不可读/不存在
+            # 这样即使用户把外层文件夹改名，也能精准识别
+            is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
+            target_conf = parent_dir / "custom-domains.conf"
+            
+            if is_translocation or not target_conf.exists():
                 safe_dir = Path.home() / ".browser_audit"
                 safe_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 向 GUI 队列投放警告
+                gui_warning_queue.put((
+                    "warning", 
+                    "【macOS 系統安全攔截提示】\n"
+                    "檢測到程序正處於 App Translocation 隨機唯讀沙盒中運行，或無法讀取同級配置。\n\n"
+                    "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個操作文件夾拖移到「應用程序 (Applications)」資料夾，或移動到其他任意新目錄後重新打開！\n\n"
+                    "否則程序將無法讀取同級目錄下的 custom-domains.conf 完整規則庫。"
+                ))
                 return safe_dir
             return parent_dir
         return Path(sys.executable).parent
