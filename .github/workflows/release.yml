@@ -11,22 +11,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 包含 'windows' 关键词，精准绑定左边 Windows 大按钮
           - os: windows-latest
             os_label: Windows_x64_普通电脑版
             asset_name: newbrowser-windows
 
-          # 2. 彻底剔除 'win' 字样，改用 'arm64'，触发下拉菜单
           - os: windows-latest
             os_label: Win_ARM64_高通骁龙本专用包
             asset_name: newbrowser-arm64
 
-          # 3. 包含 'macos' 关键词，精准绑定右边 macOS 大按钮
           - os: macos-latest
             os_label: macOS_M芯片新款
             asset_name: newbrowser-macos
 
-          # 4. 彻底剔除 'mac' 字样，改用 'intel'，触发下拉菜单 (使用 macos-latest 秒过排队)
           - os: macos-latest
             os_label: Mac_Intel_老款电脑专用包
             asset_name: newbrowser-intel
@@ -68,7 +64,6 @@ jobs:
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          # 动态判断：如果是 Intel 任务，强制在 M 芯片服务器上生成 x86_64 架构
           if [ "${{ matrix.asset_name }}" == "newbrowser-intel" ]; then
               pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --target-arch x86_64 --clean --noconfirm
           else
@@ -79,27 +74,30 @@ jobs:
           stage="dist_final/${folder_name}"
           mkdir -p "$stage"
           
-          # 1. 拷贝 App 到外层展示文件夹
           cp -r dist/BrowserAudit.app "$stage/浏览器痕迹分析.app"
-          
-          # 2. 拷贝规则文件，和 App 并排躺着
           cp custom-domains.conf "$stage/"
           
-          # 3. 【核心修复】：在 .app 内部植入路径劫持脚本，解决 Mac 路径迷航
+          # 【高级劫持修复】：防弹级 Bash 脚本
           APP_MACOS_DIR="$stage/浏览器痕迹分析.app/Contents/MacOS"
-          
-          # 隐藏真身
           mv "$APP_MACOS_DIR/BrowserAudit" "$APP_MACOS_DIR/BrowserAudit_bin"
           
-          # 写入劫持脚本 (强行向外跳4层目录，然后唤醒真身)
           cat << 'EOF' > "$APP_MACOS_DIR/BrowserAudit"
           #!/bin/bash
-          cd "$(dirname "$(dirname "$(dirname "$(dirname "$0")")")")"
-          exec "$(dirname "$0")/BrowserAudit_bin"
+          # 极其严谨地获取当前脚本的绝对路径（无视用户在哪里双击，无视路径是否有空格）
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          # 向外跳 4 层，精准定位到与 .app 并排的那个规则文件夹
+          TARGET_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+          cd "$TARGET_DIR"
+          # 唤醒真身，并将所有系统启动参数（"$@"）原封不动传给主程序
+          exec "$SCRIPT_DIR/BrowserAudit_bin" "$@"
           EOF
           
-          # 赋予执行权限
           chmod +x "$APP_MACOS_DIR/BrowserAudit"
+          
+          # 【最关键的救命补丁：苹果底层重签名】
+          # 由于我们修改了 .app 内部结构，必须使用 codesign 强行抹除旧签名并重新颁发本地证书
+          # 否则 Mac 系统会认为程序被黑客篡改，直接拦截并提示“已损坏”
+          codesign --force --deep -s - "$stage/浏览器痕迹分析.app"
           
           cd dist_final
           zip -r "${{ matrix.asset_name }}-${{ github.ref_name }}.zip" "${folder_name}"
