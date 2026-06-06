@@ -37,32 +37,30 @@ gui_warning_queue = queue.Queue()
 def get_base_directory() -> Path:
     if getattr(sys, 'frozen', False):
         if sys.platform == 'darwin':
-            # exec_dir 对应 浏览器痕迹分析.app/Contents/MacOS
             exec_dir = Path(sys.executable).parent
-            # .app 自身的绝对路径
-            app_path = exec_dir.parent.parent
-            # 获取 .app 所在的同级目录
-            parent_dir = app_path.parent
-            
-            # 检测方法：如果路径包含沙盒特征，或者同级目录下的配置文件不可读/不存在
-            # 这样即使用户把外层文件夹改名，也能精准识别
-            is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
-            target_conf = parent_dir / "custom-domains.conf"
-            
-            if is_translocation or not target_conf.exists():
-                safe_dir = Path.home() / ".browser_audit"
-                safe_dir.mkdir(parents=True, exist_ok=True)
+            # 严谨的结构判定：确保真的是在 .app 内部
+            if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
+                app_path = exec_dir.parent.parent
+                parent_dir = app_path.parent
                 
-                # 向 GUI 队列投放警告
-                gui_warning_queue.put((
-                    "warning", 
-                    "【macOS 系統安全攔截提示】\n"
-                    "檢測到程序正處於 App Translocation 隨機唯讀沙盒中運行，或無法讀取同級配置。\n\n"
-                    "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個操作文件夾拖移到「應用程序 (Applications)」資料夾，或移動到其他任意新目錄後重新打開！\n\n"
-                    "否則程序將無法讀取同級目錄下的 custom-domains.conf 完整規則庫。"
-                ))
-                return safe_dir
-            return parent_dir
+                is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
+                target_conf = parent_dir / "custom-domains.conf"
+                
+                # 如果处于隔离沙盒，或者同级配置文件根本不存在，退回安全目录
+                if is_translocation or not target_conf.exists():
+                    safe_dir = Path.home() / ".browser_audit"
+                    safe_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    gui_warning_queue.put((
+                        "warning", 
+                        "【macOS 安全隔離提示】\n"
+                        "檢測到程序正處於隨機唯讀沙盒中，或無法讀取同級配置。\n\n"
+                        "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個資料夾拖移到「應用程序 (Applications)」，或移動到其他任意新目錄後重新打開！\n\n"
+                        "否則程序將無法讀取自訂規則庫。"
+                    ))
+                    return safe_dir
+                return parent_dir
+            return Path(sys.executable).parent
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
@@ -175,16 +173,11 @@ class ScannerCore:
 
     @staticmethod
     def _snapshot_database(db_path: Path, temp_dir: Path) -> Optional[Path]:
-        """
-        👑 [终极洗牌修复] 废除所有可能引发跨平台强占式文件锁死锁的 backup API，
-        回归最纯粹、最稳健的二进制文件流分片读取，强制完成物理快照镜像隔离。
-        """
         if not db_path.exists(): return None
         snap_name = f"audit_db_{time.time_ns()}.db"
         target_main_db = temp_dir / snap_name
         
         try:
-            # 使用 'rb' 纯流式读取，在 Windows 和 Mac 底层都能直接绕过 SQLite 进程独占锁
             with open(db_path, "rb") as f_in:
                 with open(target_main_db, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
@@ -426,13 +419,10 @@ class ScannerCore:
             
             parts = domain.split('.')
             
-            # 🔥【第一優先防線：白名單強效過濾】
-            # 優先比對白名單（例如 google.com 等），命中即直接跳過，防止被後面模糊或錯位的自訂規則攔截
             for i in range(len(parts)):
                 if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
                     return 
 
-            # 🛡️【第二優先防線：專項審計規則比對】
             for i in range(len(parts)):
                 sub_domain = ".".join(parts[i:])
                 if "." in sub_domain and sub_domain in rule_dict:
@@ -533,24 +523,17 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def generate_html_file(self) -> Optional[str]:
-        home = Path.home()
-        desktop = home / "Desktop"
-        icloud_desktop = home / "Library/Mobile Documents/com~apple~CloudDocs/Desktop"
-        documents = home / "Documents"
-
-        if desktop.exists() and "com~apple~CloudDocs" not in str(desktop.resolve()): 
-            report_dir = desktop
-        elif icloud_desktop.exists(): 
-            report_dir = icloud_desktop
-        elif documents.exists(): 
-            report_dir = documents
-        else: 
-            report_dir = home
-
+        # 直接使用程序所在的运行路径，不扫描任何用户个人文件夹
+        report_dir = BASE_DIR
+        
+        # 安全防御：如果目录不可写（如权限受限），自动重定向到系统临时目录
+        if not os.access(report_dir, os.W_OK):
+            report_dir = Path(tempfile.gettempdir())
+        
         file_name = f"Browser_Audit_Report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
         target_path = report_dir / file_name
         
-        # 👑 原子级联合去重，避免相同 URL 但行为不同被误去重
+        # 3. 数据去重处理
         unique_hits = []
         seen = set()
         for h in self.all_hits:
@@ -625,7 +608,7 @@ class App(tk.Tk):
                     if self.all_hits:
                         self.current_report_path = self.generate_html_file()
                         if self.current_report_path:
-                            self.status_lbl.config(text=f"完成！报告已保存至【桌面/文档】。")
+                            self.status_lbl.config(text="完成！报告已在程序同目录下生成。")
                             self.btn_export.config(state="normal")
                             self.after(300, self.open_current_html)
                         else:
