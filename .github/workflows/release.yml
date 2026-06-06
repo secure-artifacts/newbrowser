@@ -74,30 +74,9 @@ jobs:
           stage="dist_final/${folder_name}"
           mkdir -p "$stage"
           
+          # 【纯净打包】：直接拷贝 .app 和配置文件并排，绝不修改 .app 内部文件，杜绝一切签名报错！
           cp -r dist/BrowserAudit.app "$stage/浏览器痕迹分析.app"
           cp custom-domains.conf "$stage/"
-          
-          # 【高级劫持修复】：防弹级 Bash 脚本
-          APP_MACOS_DIR="$stage/浏览器痕迹分析.app/Contents/MacOS"
-          mv "$APP_MACOS_DIR/BrowserAudit" "$APP_MACOS_DIR/BrowserAudit_bin"
-          
-          cat << 'EOF' > "$APP_MACOS_DIR/BrowserAudit"
-          #!/bin/bash
-          # 极其严谨地获取当前脚本的绝对路径（无视用户在哪里双击，无视路径是否有空格）
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          # 向外跳 4 层，精准定位到与 .app 并排的那个规则文件夹
-          TARGET_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-          cd "$TARGET_DIR"
-          # 唤醒真身，并将所有系统启动参数（"$@"）原封不动传给主程序
-          exec "$SCRIPT_DIR/BrowserAudit_bin" "$@"
-          EOF
-          
-          chmod +x "$APP_MACOS_DIR/BrowserAudit"
-          
-          # 【最关键的救命补丁：苹果底层重签名】
-          # 由于我们修改了 .app 内部结构，必须使用 codesign 强行抹除旧签名并重新颁发本地证书
-          # 否则 Mac 系统会认为程序被黑客篡改，直接拦截并提示“已损坏”
-          codesign --force --deep -s - "$stage/浏览器痕迹分析.app"
           
           cd dist_final
           zip -r "${{ matrix.asset_name }}-${{ github.ref_name }}.zip" "${folder_name}"
