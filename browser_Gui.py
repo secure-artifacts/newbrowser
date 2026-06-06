@@ -15,23 +15,22 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 # =================================================
-# 1. Mac 两栖双击工作目录自适应锚定 (绝对防丢失)
+# 1. 全平台绝对路径自适应锚定核心 (v1.1.0 工业级闭环)
 # =================================================
 if getattr(sys, 'frozen', False):
-    try:
-        if sys.platform == 'darwin':
-            if ".app/Contents/MacOS" in sys.executable:
-                real_parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
-                os.chdir(real_parent_dir)
-            else:
-                real_parent_dir = os.path.dirname(sys.executable)
-                os.chdir(real_parent_dir)
-        elif os.name == 'nt':
-            real_parent_dir = os.path.dirname(sys.executable)
-            os.chdir(real_parent_dir)
-    except: pass
+    if sys.platform == 'darwin':
+        # Mac 打包环境下，精准向外退 4 层到 .app 外面的用户真实目录
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
+    else:
+        # Windows 打包环境下，直接获取 .exe 所在目录
+        BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # 开发调试环境下，获取当前 .py 脚本所在目录
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CUSTOM_FILE = "custom-domains.conf"
+# 全局强绑定绝对路径，彻底免疫系统级当前目录（CWD）丢失带来的盲区
+CUSTOM_FILE = os.path.join(BASE_DIR, "custom-domains.conf")
+
 TEMP_DIR = tempfile.gettempdir()
 HTML_REPORT_PATH = os.path.join(TEMP_DIR, "browser_audit_report.html")
 
@@ -96,7 +95,6 @@ class ResourceManager:
                             match = re.match(r"^server=/([^/]+)/", line)
                             if match:
                                 domain = match.group(1).strip().lower()
-                                # 🌟 杂质过滤：丢弃没有点号或长度过短的极简废弃规则（如 com, net, org）
                                 if len(domain) < 4 or "." not in domain:
                                     continue
                                 rules[domain] = "专项审计目标"
@@ -116,7 +114,6 @@ class ResourceManager:
 # 2. 扫描内核：五合一高穿透双栖核心 (终极后缀匹配引擎)
 # =================================================
 class ScannerCore:
-    # 🌟 强效全局白名单：涵盖系统级通信、商店、安全更新等底层框架
     GLOBAL_WHITE_LIST = [
         "google.com", "google.com.hk", "gstatic.com", "googleapis.com", 
         "googleusercontent.com", "g.co", "ggpht.com", 
@@ -252,7 +249,6 @@ class ScannerCore:
             if ":" in domain:
                 domain = domain.split(":")[0]
             
-            # 🌟 1. 白名单过滤：采用精确后缀对齐，彻底免疫 google.com, microsoft365.com 等旗下所有子域名
             is_white = False
             for w in ScannerCore.GLOBAL_WHITE_LIST:
                 if domain == w or domain.endswith('.' + w):
@@ -260,9 +256,6 @@ class ScannerCore:
                     break
             if is_white: return
                 
-            # 🌟 2. 核心比对：彻底废除 t in domain。采用精确主域名与子域名边界对齐
-            # 即使清单有 security，也不会误杀 cgsecurity.org；
-            # 如果清单有 capcut.com，则能完美穿透并抓到 video.capcut.com
             for t in targets:
                 if domain == t or domain.endswith('.' + t):
                     hits.append((profile["b"], profile["p"], info_type, rule_dict[t], url))
@@ -270,7 +263,7 @@ class ScannerCore:
         except: pass
 
 # =================================================
-# 3. 精致控制台 GUI (自适应防卡死)
+# 3. 精致控制台 GUI (自适应高级事件流驱动)
 # =================================================
 class App(tk.Tk):
     def __init__(self):
@@ -383,8 +376,14 @@ class App(tk.Tk):
 
     def _process_queue(self):
         try:
-            while True:
-                msg, val = self.queue.get_nowait()
+            processed_count = 0
+            while processed_count < 100:
+                try:
+                    msg, val = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                
+                processed_count += 1
                 if msg == "progress": self.pbar["value"] = val
                 elif msg == "msg": self.status_lbl.config(text=val)
                 elif msg == "data":
@@ -401,8 +400,8 @@ class App(tk.Tk):
                     else:
                         self.status_lbl.config(text="扫描完成：系统处于纯净合规状态。")
                         messagebox.showinfo("检测结果", "未检测到任何相关的交互历史。")
-        except queue.Empty: pass
-        finally: self.after(100, self._process_queue)
+        finally: 
+            self.after(100, self._process_queue)
 
     def on_exit(self):
         ResourceManager.cleanup()
