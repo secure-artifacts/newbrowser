@@ -11,29 +11,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 对应前端 Windows 大按钮
+          # 1. 包含 'windows' 关键词，100% 精准绑定左边 Windows 下载大按钮
           - os: windows-latest
-            is_main: 'true'
             os_label: Windows_x64_普通电脑版
-            file_prefix: newbrowser-v1.0.2-Windows_x64
+            asset_name: newbrowser-windows
 
-          # 2. 对应高通骁龙本（使用标准运行环境打包，彻底避开官方服务器Bug）
+          # 2. 彻底剔除 'win' 字样，改用最标准、无冲突的 'arm64'，100% 自动掉进“其他产物”
           - os: windows-latest
-            is_main: 'false'
             os_label: Win_ARM64_高通骁龙本专用包
-            file_prefix: Win_ARM64_高通骁龙本专用包
+            asset_name: newbrowser-arm64
 
-          # 3. 对应前端 macOS 大按钮
+          # 3. 包含 'macos' 关键词，100% 精准绑定右边 macOS 下载大按钮
           - os: macos-latest
-            is_main: 'true'
             os_label: macOS_M芯片新款
-            file_prefix: newbrowser-v1.0.2-macOS
+            asset_name: newbrowser-macos
 
-          # 4. 对应 Intel 老款 Mac
-          - os: macos-15-intel
-            is_main: 'false'
+          # 4. 彻底剔除 'mac' 字样，改用最标准、无冲突的 'intel'，100% 自动掉进“其他产物”
+          - os: macos-13
             os_label: Mac_Intel_老款电脑专用包
-            file_prefix: Mac_Intel_老款电脑专用包
+            asset_name: newbrowser-intel
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -57,19 +53,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
           
-          # 内部文件夹和解压产物保持全中文
+          # 内部解压出来的文件夹和程序名称依然保持你最完美的纯中文
           $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
-          $targetPath = "dist_final/$folderName"
-          New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
+          $stage = "dist_final/$folderName"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
           
-          # 复制中文核心程序和 4.1M 规则库
-          Copy-Item dist/BrowserAudit.exe "$targetPath/浏览器痕迹分析.exe"
-          Copy-Item "custom-domains.conf" $targetPath/
+          Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
+          Copy-Item "custom-domains.conf" "$stage/" -Force
           
-          # 压缩包外部名字保持规范前缀，确保前端网站大按钮一秒识别接通
-          Compress-Archive -Path $targetPath -DestinationPath "dist_final/${{ matrix.file_prefix }}.zip" -Force
+          # 外部压缩包文件名采用隔离匹配的专属资产名
+          Compress-Archive -Path $stage -DestinationPath "dist_final/${{ matrix.asset_name }}-${{ github.ref_name }}.zip" -Force
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
@@ -77,13 +73,14 @@ jobs:
           pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
           
           folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
-          mkdir -p "dist_final/${folder_name}"
+          stage="dist_final/${folder_name}"
+          mkdir -p "$stage"
           
-          cp -r dist/BrowserAudit.app "dist_final/${folder_name}/浏览器痕迹分析.app"
-          cp "custom-domains.conf" "dist_final/${folder_name}/"
+          cp -r dist/BrowserAudit.app "$stage/浏览器痕迹分析.app"
+          cp custom-domains.conf "$stage/"
           
-          # 压缩包外部名字保持规范前缀
-          cd dist_final && zip -r "${{ matrix.file_prefix }}.zip" "${folder_name}"
+          cd dist_final
+          zip -r "${{ matrix.asset_name }}-${{ github.ref_name }}.zip" "${folder_name}"
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
