@@ -11,29 +11,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. 对应前端 Windows 大按钮
+          # 1. 对应前端 Windows 大按钮 (恢复网站死认的规范前缀)
           - os: windows-latest
             is_main: 'true'
             os_label: Windows_x64_普通电脑版
-            py_ver: '3.10'
+            file_prefix: newbrowser-v1.0.2-Windows_x64
 
           # 2. 优雅避让，完美掉进【其他产物】下拉菜单
           - os: windows-11-arm
             is_main: 'false'
             os_label: Win_ARM64_高通骁龙本专用包
-            py_ver: '3.11'
+            file_prefix: Win_ARM64_高通骁龙本专用包
 
-          # 3. 对应前端 macOS 大按钮
+          # 3. 对应前端 macOS 大按钮 (恢复网站死认的规范前缀)
           - os: macos-latest
             is_main: 'true'
             os_label: macOS_M芯片新款
-            py_ver: '3.10'
+            file_prefix: newbrowser-v1.0.2-macOS
 
           # 4. 优雅避让，完美掉进【其他产物】下拉菜单
           - os: macos-15-intel
             is_main: 'false'
             os_label: Mac_Intel_老款电脑专用包
-            py_ver: '3.10'
+            file_prefix: Mac_Intel_老款电脑专用包
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -48,7 +48,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.py_ver }}
+          python-version: '3.10'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -57,54 +57,33 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 【核心修改】将编译出来的软件名称直接改为中文
-          pyinstaller -F -w browser_Gui.py --name 浏览器痕迹分析 --clean --noconfirm
+          pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
           
-          if ('${{ matrix.is_main }}' -eq 'true') {
-              $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
-          } else {
-              $folderName = "${{ matrix.os_label }}"
-          }
-          
+          # 内部文件夹和解压产物保持最漂亮的中文
+          $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           $targetPath = "dist_final/$folderName"
           New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
           
-          # 【核心修改】复制中文命名的 .exe 文件
-          Copy-Item dist/浏览器痕迹分析.exe $targetPath/
+          # 复制中文核心程序和 4.1M 规则库
+          Copy-Item dist/BrowserAudit.exe "$targetPath/浏览器痕迹分析.exe"
+          Copy-Item "custom-domains.conf" $targetPath/
           
-          if (Test-Path "custom-domains.conf") {
-              Copy-Item "custom-domains.conf" $targetPath/
-          } else {
-              Write-Host "错误: 未在仓库根目录检测到 custom-domains.conf 文件！"
-              exit 1
-          }
-          
-          Compress-Archive -Path $targetPath -DestinationPath "dist_final/${folderName}.zip" -Force
+          # 压缩包外部改回规范名字，骗过前端死板的扫描机器人
+          Compress-Archive -Path $targetPath -DestinationPath "dist_final/${{ matrix.file_prefix }}.zip" -Force
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          # 【核心修改】将编译出来的 Mac 应用名称直接改为中文
-          pyinstaller --onedir --windowed --name 浏览器痕迹分析 browser_Gui.py --clean --noconfirm
+          pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
           
-          if [ "${{ matrix.is_main }}" == "true" ]; then
-              folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
-          else
-              folder_name="${{ matrix.os_label }}"
-          fi
-          
+          folder_name="浏览器痕痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           mkdir -p "dist_final/${folder_name}"
-          # 【核心修改】复制中文命名的 .app 目录
-          cp -r dist/浏览器痕迹分析.app "dist_final/${folder_name}/"
           
-          if [ -f "custom-domains.conf" ]; then
-              cp "custom-domains.conf" "dist_final/${folder_name}/"
-          else
-              echo "错误: 未在仓库根目录检测到 custom-domains.conf 文件!"
-              exit 1
-          fi
+          cp -r dist/BrowserAudit.app "dist_final/${folder_name}/浏览器痕迹分析.app"
+          cp "custom-domains.conf" "dist_final/${folder_name}/"
           
-          cd dist_final && zip -r "${folder_name}.zip" "${folder_name}"
+          # 压缩包外部改回规范名字
+          cd dist_final && zip -r "${{ matrix.file_prefix }}.zip" "${folder_name}"
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
