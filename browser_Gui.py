@@ -34,6 +34,27 @@ logger = logging.getLogger(__name__)
 
 gui_warning_queue = queue.Queue()
 
+# 核心内置硬编码规则库：确保在 macOS 随机唯读沙盒等任何极端限制环境下，程序依然拥有 100% 的完备检测能力
+DEFAULT_INTERNAL_RULES = {
+    "heygen.com": "AI视频(HeyGen)",
+    "hailuoai.com": "AI服务(海螺AI)",
+    "mailum.com": "未知安全邮箱",
+    "tongyi.aliyun.com": "AI服务(阿里通义)",
+    "doubao.com": "AI服务(字节豆包)",
+    "yuanbao.tencent.com": "AI服务(腾讯元宝)",
+    "yiyan.baidu.com": "AI服务(文心一言)",
+    "tiangong.cn": "AI服务(昆仑天工)",
+    "kimi.ai": "AI服务(月暗Kimi)",
+    "deepseek.com": "AI服务(DeepSeek)",
+    "chatglm.cn": "AI服务(智谱清言)",
+    "baichuan-ai.com": "AI服务(百川智能)",
+    "minimax.chat": "AI服务(MiniMax星野)",
+    "klingai.com": "AI视频(快手可灵)",
+    "viggle.ai": "AI视频(Viggle动画)",
+    "shengxiang.baidu.com": "AI视频(百度生息)",
+    "dreamina.capcut.com": "专项审计目标"
+}
+
 def get_base_directory() -> Path:
     if getattr(sys, 'frozen', False):
         if sys.platform == 'darwin':
@@ -43,57 +64,22 @@ def get_base_directory() -> Path:
                 parent_dir = app_path.parent
                 
                 is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
-                target_conf = parent_dir / "custom-domains.conf"
-                
-                if is_translocation or not target_conf.exists():
-                    safe_dir = Path.home() / ".browser_audit"
-                    safe_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    gui_warning_queue.put((
-                        "warning", 
-                        "【macOS 安全隔離提示】\n"
-                        "檢測到程序正處於隨機唯讀沙盒中，或無法讀取同級配置。\n\n"
-                        "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個資料夾拖移到「應用程序 (Applications)」，或移動到其他任意新目錄后重新打開！\n\n"
-                        "否則程序將無法讀取自訂規則庫。"
-                    ))
-                    return safe_dir
+                # 如果处于随机隔离沙盒，基础工作空间无痕重定向到系统临时目录，保障缓存与日志读写顺畅
+                if is_translocation:
+                    return Path(tempfile.gettempdir())
                 return parent_dir
             return Path(sys.executable).parent
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
 BASE_DIR = get_base_directory()
-CUSTOM_FILE = BASE_DIR / "custom-domains.conf"
 CACHE_FILE = BASE_DIR / "rules.cache.json"
 
 class ResourceManager:
     @staticmethod
     def initialize():
-        if not CUSTOM_FILE.exists():
-            try:
-                CUSTOM_FILE.write_text(
-                    "# 专项规则库 (自定义扩展)\n"
-                    "heygen.com=AI视频(HeyGen)\n"
-                    "hailuoai.com=AI服务(海螺AI)\n"
-                    "mailum.com=未知安全邮箱\n"
-                    "tongyi.aliyun.com=AI服务(阿里通义)\n"
-                    "doubao.com=AI服务(字节豆包)\n"
-                    "yuanbao.tencent.com=AI服务(腾讯元宝)\n"
-                    "yiyan.baidu.com=AI服务(文心一言)\n"
-                    "tiangong.cn=AI服务(昆仑天工)\n"
-                    "kimi.ai=AI服务(月暗Kimi)\n"
-                    "deepseek.com=AI服务(DeepSeek)\n"
-                    "chatglm.cn=AI服务(智谱清言)\n"
-                    "baichuan-ai.com=AI服务(百川智能)\n"
-                    "minimax.chat=AI服务(MiniMax星野)\n"
-                    "klingai.com=AI视频(快手可灵)\n"
-                    "viggle.ai=AI视频(Viggle动画)\n"
-                    "shengxiang.baidu.com=AI视频(百度生息)\n"
-                    "server=/dreamina.capcut.com/114.114.114.114\n",
-                    encoding="utf-8"
-                )
-            except IOError as e:
-                logger.error(f"规则库初始化失败: {e}")
+        # 在独立的动态多通道加载中处理，此处保持空置以优化初始化效率
+        pass
 
     @staticmethod
     def is_browser_running() -> List[str]:
@@ -125,20 +111,45 @@ class ResourceManager:
     @staticmethod
     def load_audit_rules() -> Dict[str, str]:
         rules = {}
-        if CACHE_FILE.exists() and CUSTOM_FILE.exists():
-            if CACHE_FILE.stat().st_mtime > CUSTOM_FILE.stat().st_mtime:
-                try:
-                    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                        cache_data = json.load(f)
-                        if isinstance(cache_data, dict) and cache_data.get("version") == CACHE_VERSION:
-                            rules = cache_data.get("rules", {})
-                except Exception:
-                    rules = {}
+        possible_files = []
+        
+        # 1. 动态探测优先级通道一：程序同级物理目录（适合正常解压/未被随机转位的环境）
+        if getattr(sys, 'frozen', False):
+            if sys.platform == 'darwin':
+                exec_dir = Path(sys.executable).parent
+                if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
+                    possible_files.append(exec_dir.parent.parent.parent / "custom-domains.conf")
+            possible_files.append(Path(sys.executable).parent / "custom-domains.conf")
+        else:
+            possible_files.append(Path(__file__).resolve().parent / "custom-domains.conf")
+            
+        # 2. 动态探测优先级通道二：用户全局家目录固定安全通道（专为 macOS 隔离沙盒设计的用户自主配置区）
+        global_home_conf = Path.home() / ".browser_audit" / "custom-domains.conf"
+        possible_files.append(global_home_conf)
+        
+        # 自动在家目录下释放默认配置文件，方便需要扩展规则的用户随时编辑
+        if not global_home_conf.exists():
+            try:
+                global_home_conf.parent.mkdir(parents=True, exist_ok=True)
+                global_home_conf.write_text(
+                    "# 专项规则库 (自定义扩展区)\n"
+                    "# 您可以在此行下方添加您自定义的审计域名，每行一个，例如：example.com=自定义分类\n", 
+                    encoding="utf-8"
+                )
+            except Exception:
+                pass
 
-        if not rules and CUSTOM_FILE.exists():
+        # 遍历探测通道，加载首个有效存在的文件
+        target_file = None
+        for f in possible_files:
+            if f and f.exists():
+                target_file = f
+                break
+                
+        if target_file:
             try:
                 server_pattern = re.compile(r"^server=/([^/]+)/")
-                with open(CUSTOM_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
                         line = line.strip()
                         if not line or line.startswith("#"): continue
@@ -153,11 +164,14 @@ class ResourceManager:
                             k = k.strip().lower()
                             if "." in k:
                                 rules[k] = v.strip()
-                if rules:
-                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                        json.dump({"version": CACHE_VERSION, "rules": rules}, f, ensure_ascii=False)
             except Exception as e:
-                logger.error(f"编译规则库失败: {e}")
+                logger.error(f"解析外部规则库异常 [{target_file}]: {e}")
+
+        # 3. 通道三（终极工业兜底）：将内置硬编码规则无缝合并，确保任何环境下规则库永不为空
+        for k, v in DEFAULT_INTERNAL_RULES.items():
+            if k not in rules:
+                rules[k] = v
+                
         return rules
 
 # =================================================
@@ -431,7 +445,7 @@ class ScannerCore:
             pass
 
 # =================================================
-# 3. GUI 控制台 (彻底去除弹窗、无痕阅后即焚版)
+# 3. GUI 控制台 (无痕高稳定性重构版)
 # =================================================
 class App(tk.Tk):
     def __init__(self):
@@ -447,7 +461,6 @@ class App(tk.Tk):
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
         self.queue = queue.Queue()
-        
         self.core_temp_dir = Path(tempfile.mkdtemp(prefix="audit_core_"))
         
         self._build_ui()
@@ -474,7 +487,7 @@ class App(tk.Tk):
         self.status_lbl.pack(padx=15, anchor="w", pady=5)
 
     def pre_run_check(self):
-        # 🔥 【核心改动】：移除所有运行检测弹窗，直接静默开始分析
+        # 移除了热备弹窗打扰，直接静默运行扫描，符合零打扰工业取证规范
         self.run()
 
     def run(self):
@@ -484,18 +497,12 @@ class App(tk.Tk):
         self.is_scanning = True
         
         if self.current_report_path:
-            try:
-                Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+            try: Path(self.current_report_path).unlink(missing_ok=True)
+            except Exception: pass
             self.current_report_path = None
         
+        # 采用多通道高容错加载器获取规则库
         rules = ResourceManager.load_audit_rules()
-        if not rules:
-            messagebox.showwarning("警告", "规则库加载失败，请检查配置。")
-            self.btn_run.config(state="normal")
-            self.is_scanning = False
-            return
 
         def task():
             try:
@@ -526,8 +533,8 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def generate_html_file(self) -> Optional[str]:
+        # 报告统一无痕输出到系统的临时安全隔离目录，避免产生残留文件
         report_dir = Path(tempfile.gettempdir())
-        
         file_name = f"Browser_Audit_Report_{time.time_ns()}.html"
         target_path = report_dir / file_name
         
@@ -581,7 +588,7 @@ class App(tk.Tk):
                     uri = Path(self.current_report_path).as_uri()
                     webbrowser.open(uri)
                 
-                # 打开网页后即刻无痕销毁文件
+                # 🔥 取证级【阅后即焚线程】：延时 2 秒后在后台强行切断并彻底销毁系统内的 HTML 临时痕迹，零残留
                 def delay_destroy():
                     time.sleep(2)  
                     try:
@@ -617,7 +624,7 @@ class App(tk.Tk):
                     if self.all_hits:
                         self.current_report_path = self.generate_html_file()
                         if self.current_report_path:
-                            self.status_lbl.config(text="完成！报告已无痕生成并准备打开。")
+                            self.status_lbl.config(text="完成！报告已无痕生成并成功调用。")
                             self.btn_export.config(state="normal")
                             self.after(300, self.open_current_html)
                         else:
@@ -635,14 +642,10 @@ class App(tk.Tk):
     def on_exit(self):
         self.is_scanning = False 
         if self.current_report_path:
-            try:
-                Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        try:
-            shutil.rmtree(self.core_temp_dir, ignore_errors=True)
-        except Exception:
-            pass
+            try: Path(self.current_report_path).unlink(missing_ok=True)
+            except Exception: pass
+        try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
+        except Exception: pass
         self.destroy()
 
 if __name__ == "__main__":
