@@ -101,7 +101,7 @@ class ResourceManager:
                     for b in browsers:
                         if b not in running:
                             if proc_name == b or proc_name.startswith(f"{b}."):
-                                running.append(b)
+                                        running.append(b)
         except Exception as e:
             logger.debug(f"进程检测异常: {e}")
         return running
@@ -544,12 +544,11 @@ class App(tk.Tk):
         for h in unique_hits:
             raw_url = h[4]
             safe_url = html.escape(raw_url, quote=True)
-            clean_href = safe_url if raw_url.strip().lower().startswith(("http://", "https://")) else "#"
 
             html_content.append(
                 f"<tr><td>{html.escape(h[0])}</td><td>{html.escape(h[1])}</td>"
                 f"<td>{html.escape(h[2])}</td><td><strong>{html.escape(h[3])}</strong></td>"
-                f"<td class='url-cell'><a href='{clean_href}' target='_blank' title='{safe_url}'>{safe_url}</a></td></tr>"
+                f"<td class='url-cell' title='{safe_url}'>{safe_url}</td></tr>"
             )
             
         html_content.append("</table></div></body></html>")
