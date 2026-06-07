@@ -34,52 +34,74 @@ logger = logging.getLogger(__name__)
 
 gui_warning_queue = queue.Queue()
 
-# 核心内置硬编码规则库：确保在 macOS 随机唯读沙盒等任何极端限制环境下，程序依然拥有 100% 的完备检测能力
-DEFAULT_INTERNAL_RULES = {
-    "heygen.com": "AI视频(HeyGen)",
-    "hailuoai.com": "AI服务(海螺AI)",
-    "mailum.com": "未知安全邮箱",
-    "tongyi.aliyun.com": "AI服务(阿里通义)",
-    "doubao.com": "AI服务(字节豆包)",
-    "yuanbao.tencent.com": "AI服务(腾讯元宝)",
-    "yiyan.baidu.com": "AI服务(文心一言)",
-    "tiangong.cn": "AI服务(昆仑天工)",
-    "kimi.ai": "AI服务(月暗Kimi)",
-    "deepseek.com": "AI服务(DeepSeek)",
-    "chatglm.cn": "AI服务(智谱清言)",
-    "baichuan-ai.com": "AI服务(百川智能)",
-    "minimax.chat": "AI服务(MiniMax星野)",
-    "klingai.com": "AI视频(快手可灵)",
-    "viggle.ai": "AI视频(Viggle动画)",
-    "shengxiang.baidu.com": "AI视频(百度生息)",
-    "dreamina.capcut.com": "专项审计目标"
-}
-
 def get_base_directory() -> Path:
     if getattr(sys, 'frozen', False):
         if sys.platform == 'darwin':
             exec_dir = Path(sys.executable).parent
+            # 严格的结构判定：确保在标准的 macOS .app 包内 (Contents/MacOS/executable)
             if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
-                app_path = exec_dir.parent.parent
-                parent_dir = app_path.parent
+                # 获取 .app 所在的绝对同级目录
+                app_bundle_dir = exec_dir.parent.parent.parent
                 
-                is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
-                # 如果处于随机隔离沙盒，基础工作空间无痕重定向到系统临时目录，保障缓存与日志读写顺畅
+                # 【最高优先级】：如果 .app 同级目录下存在自定义规则文件，直接认定该目录为基准目录
+                if (app_bundle_dir / "custom-domains.conf").exists():
+                    return app_bundle_dir
+                
+                # 【次级防御】：检查程序是否被 macOS 强行塞入了随机只读沙盒 (App Translocation)
+                is_translocation = "AppTranslocation" in str(app_bundle_dir) or "/var/folders" in str(app_bundle_dir)
                 if is_translocation:
-                    return Path(tempfile.gettempdir())
-                return parent_dir
+                    safe_dir = Path.home() / ".browser_audit"
+                    safe_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    gui_warning_queue.put((
+                        "warning", 
+                        "【macOS 安全隔離提示】\n"
+                        "檢測到程序正處於隨機唯讀沙盒中，且無法在同級目錄讀取或創建配置。\n\n"
+                        "【解決辦法】：\n"
+                        f"請將您的自訂規則文件 [custom-domains.conf] 複製到以下安全路徑中：\n"
+                        f"{safe_dir}\n\n"
+                        "或者：請不要直接在「下載」夾中雙擊運行。請在 Finder 中將整個程序資料夾拖移到其他任意新目錄（如應用程序）後再打開！"
+                    ))
+                    return safe_dir
+                
+                # 如果既没有被隔离，同级也确实没放文件，则默认以 .app 同级作为工作目录（用于自动初始化生成文件）
+                return app_bundle_dir
             return Path(sys.executable).parent
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
 BASE_DIR = get_base_directory()
+CUSTOM_FILE = BASE_DIR / "custom-domains.conf"
 CACHE_FILE = BASE_DIR / "rules.cache.json"
 
 class ResourceManager:
     @staticmethod
     def initialize():
-        # 在独立的动态多通道加载中处理，此处保持空置以优化初始化效率
-        pass
+        if not CUSTOM_FILE.exists():
+            try:
+                CUSTOM_FILE.write_text(
+                    "# 专项规则库 (自定义扩展)\n"
+                    "heygen.com=AI视频(HeyGen)\n"
+                    "hailuoai.com=AI服务(海螺AI)\n"
+                    "mailum.com=未知安全邮箱\n"
+                    "tongyi.aliyun.com=AI服务(阿里通义)\n"
+                    "doubao.com=AI服务(字节豆包)\n"
+                    "yuanbao.tencent.com=AI服务(腾讯元宝)\n"
+                    "yiyan.baidu.com=AI服务(文心一言)\n"
+                    "tiangong.cn=AI服务(昆仑天工)\n"
+                    "kimi.ai=AI服务(月暗Kimi)\n"
+                    "deepseek.com=AI服务(DeepSeek)\n"
+                    "chatglm.cn=AI服务(智谱清言)\n"
+                    "baichuan-ai.com=AI服务(百川智能)\n"
+                    "minimax.chat=AI服务(MiniMax星野)\n"
+                    "klingai.com=AI视频(快手可灵)\n"
+                    "viggle.ai=AI视频(Viggle动画)\n"
+                    "shengxiang.baidu.com=AI视频(百度生息)\n"
+                    "server=/dreamina.capcut.com/114.114.114.114\n",
+                    encoding="utf-8"
+                )
+            except IOError as e:
+                logger.error(f"规则库初始化失败: {e}")
 
     @staticmethod
     def is_browser_running() -> List[str]:
@@ -111,45 +133,20 @@ class ResourceManager:
     @staticmethod
     def load_audit_rules() -> Dict[str, str]:
         rules = {}
-        possible_files = []
-        
-        # 1. 动态探测优先级通道一：程序同级物理目录（适合正常解压/未被随机转位的环境）
-        if getattr(sys, 'frozen', False):
-            if sys.platform == 'darwin':
-                exec_dir = Path(sys.executable).parent
-                if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
-                    possible_files.append(exec_dir.parent.parent.parent / "custom-domains.conf")
-            possible_files.append(Path(sys.executable).parent / "custom-domains.conf")
-        else:
-            possible_files.append(Path(__file__).resolve().parent / "custom-domains.conf")
-            
-        # 2. 动态探测优先级通道二：用户全局家目录固定安全通道（专为 macOS 隔离沙盒设计的用户自主配置区）
-        global_home_conf = Path.home() / ".browser_audit" / "custom-domains.conf"
-        possible_files.append(global_home_conf)
-        
-        # 自动在家目录下释放默认配置文件，方便需要扩展规则的用户随时编辑
-        if not global_home_conf.exists():
-            try:
-                global_home_conf.parent.mkdir(parents=True, exist_ok=True)
-                global_home_conf.write_text(
-                    "# 专项规则库 (自定义扩展区)\n"
-                    "# 您可以在此行下方添加您自定义的审计域名，每行一个，例如：example.com=自定义分类\n", 
-                    encoding="utf-8"
-                )
-            except Exception:
-                pass
+        if CACHE_FILE.exists() and CUSTOM_FILE.exists():
+            if CACHE_FILE.stat().st_mtime > CUSTOM_FILE.stat().st_mtime:
+                try:
+                    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                        cache_data = json.load(f)
+                        if isinstance(cache_data, dict) and cache_data.get("version") == CACHE_VERSION:
+                            rules = cache_data.get("rules", {})
+                except Exception:
+                    rules = {}
 
-        # 遍历探测通道，加载首个有效存在的文件
-        target_file = None
-        for f in possible_files:
-            if f and f.exists():
-                target_file = f
-                break
-                
-        if target_file:
+        if not rules and CUSTOM_FILE.exists():
             try:
                 server_pattern = re.compile(r"^server=/([^/]+)/")
-                with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(CUSTOM_FILE, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
                         line = line.strip()
                         if not line or line.startswith("#"): continue
@@ -164,14 +161,11 @@ class ResourceManager:
                             k = k.strip().lower()
                             if "." in k:
                                 rules[k] = v.strip()
+                if rules:
+                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                        json.dump({"version": CACHE_VERSION, "rules": rules}, f, ensure_ascii=False)
             except Exception as e:
-                logger.error(f"解析外部规则库异常 [{target_file}]: {e}")
-
-        # 3. 通道三（终极工业兜底）：将内置硬编码规则无缝合并，确保任何环境下规则库永不为空
-        for k, v in DEFAULT_INTERNAL_RULES.items():
-            if k not in rules:
-                rules[k] = v
-                
+                logger.error(f"编译规则库失败: {e}")
         return rules
 
 # =================================================
@@ -445,7 +439,7 @@ class ScannerCore:
             pass
 
 # =================================================
-# 3. GUI 控制台 (无痕高稳定性重构版)
+# 3. GUI 控制台
 # =================================================
 class App(tk.Tk):
     def __init__(self):
@@ -487,7 +481,10 @@ class App(tk.Tk):
         self.status_lbl.pack(padx=15, anchor="w", pady=5)
 
     def pre_run_check(self):
-        # 移除了热备弹窗打扰，直接静默运行扫描，符合零打扰工业取证规范
+        running = ResourceManager.is_browser_running()
+        if running:
+            browsers = ", ".join(running).title()
+            if not messagebox.askokcancel("提取提示", f"检测到 {browsers} 正在运行。\n系统将采用热备方案安全提取，是否继续？"): return
         self.run()
 
     def run(self):
@@ -496,13 +493,12 @@ class App(tk.Tk):
         self.all_hits.clear()
         self.is_scanning = True
         
-        if self.current_report_path:
-            try: Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception: pass
-            self.current_report_path = None
-        
-        # 采用多通道高容错加载器获取规则库
         rules = ResourceManager.load_audit_rules()
+        if not rules:
+            messagebox.showwarning("警告", "规则库加载失败，请检查配置。")
+            self.btn_run.config(state="normal")
+            self.is_scanning = False
+            return
 
         def task():
             try:
@@ -533,11 +529,16 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def generate_html_file(self) -> Optional[str]:
-        # 报告统一无痕输出到系统的临时安全隔离目录，避免产生残留文件
-        report_dir = Path(tempfile.gettempdir())
-        file_name = f"Browser_Audit_Report_{time.time_ns()}.html"
+        report_dir = BASE_DIR
+        
+        # 安全防御：如果目录不可写（如权限受限），自动重定向到系统临时目录
+        if not os.access(report_dir, os.W_OK):
+            report_dir = Path(tempfile.gettempdir())
+        
+        file_name = f"Browser_Audit_Report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
         target_path = report_dir / file_name
         
+        # 数据去重处理
         unique_hits = []
         seen = set()
         for h in self.all_hits:
@@ -587,21 +588,9 @@ class App(tk.Tk):
                 else:
                     uri = Path(self.current_report_path).as_uri()
                     webbrowser.open(uri)
-                
-                # 🔥 取证级【阅后即焚线程】：延时 2 秒后在后台强行切断并彻底销毁系统内的 HTML 临时痕迹，零残留
-                def delay_destroy():
-                    time.sleep(2)  
-                    try:
-                        if self.current_report_path and os.path.exists(self.current_report_path):
-                            os.unlink(self.current_report_path)
-                            self.current_report_path = None
-                    except Exception:
-                        pass
-                threading.Thread(target=delay_destroy, daemon=True).start()
-                    
             except Exception as e:
                 logger.error(f"打开报告文件异常: {e}")
-                messagebox.showerror("打开浏览器失败", f"无法自动唤醒浏览器:\n{self.current_report_path}")
+                messagebox.showerror("打开浏览器失败", f"无法自动唤醒浏览器，请手动打开:\n{self.current_report_path}")
 
     def _process_queue(self):
         try:
@@ -624,7 +613,7 @@ class App(tk.Tk):
                     if self.all_hits:
                         self.current_report_path = self.generate_html_file()
                         if self.current_report_path:
-                            self.status_lbl.config(text="完成！报告已无痕生成并成功调用。")
+                            self.status_lbl.config(text="完成！报告已在程序同目录下生成。")
                             self.btn_export.config(state="normal")
                             self.after(300, self.open_current_html)
                         else:
@@ -641,9 +630,6 @@ class App(tk.Tk):
 
     def on_exit(self):
         self.is_scanning = False 
-        if self.current_report_path:
-            try: Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception: pass
         try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
         except Exception: pass
         self.destroy()
