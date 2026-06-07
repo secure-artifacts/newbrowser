@@ -448,7 +448,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("浏览器痕迹分析") 
-        self.geometry("460x170") # 👑 去掉按钮后，窗口高度调小，界面更紧凑
+        self.geometry("460x170") 
         self.resizable(False, False)
         
         self.all_hits = []
@@ -472,7 +472,6 @@ class App(tk.Tk):
 
         btn_box = tk.Frame(self)
         btn_box.pack(fill=tk.X, padx=15, pady=5)
-        # 👑 只保留一个“开始检测”按钮，实现完全单键自动化
         self.btn_run = tk.Button(btn_box, text="🚀 开始检测", command=self.pre_run_check, font=("Arial", 10, "bold"), height=2)
         self.btn_run.pack(fill=tk.X, expand=True)
 
@@ -520,7 +519,6 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def execute_instant_report(self):
-        """👑 终极无痕闭环：生成、唤醒渲染、0.5秒内立刻物理粉碎文件"""
         if not self.all_hits: return
 
         report_dir = Path(tempfile.gettempdir())
@@ -559,17 +557,14 @@ class App(tk.Tk):
         html_content.append("</table></div></body></html>")
         
         try:
-            # 1. 物理写入临时目录
             with open(target_path, "w", encoding="utf-8") as f: 
                 f.write("".join(html_content))
             
-            # 2. 立刻唤醒系统默认浏览器进行内存加载渲染
             if sys.platform == "darwin":
                 subprocess.Popen(["open", str(target_path)])
             else:
                 webbrowser.open(target_path.as_uri())
             
-            # 3. 👑 强力擦除：给浏览器系统 500 毫秒读取网页内容的时间，随后立刻删除文件（阅后即焚）
             def shredder():
                 time.sleep(0.5)
                 try:
@@ -601,7 +596,6 @@ class App(tk.Tk):
                     self.all_hits = val
                     
                     if self.all_hits:
-                        # 👑 检测完成直接无痕执行结果展现并立即物理擦除文件，不给临时目录留任何可驻留机会
                         self.execute_instant_report()
                         self.status_lbl.config(text="完成！分析结果已无痕渲染。")
                     else:
