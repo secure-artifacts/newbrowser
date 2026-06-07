@@ -64,7 +64,6 @@ def get_base_directory() -> Path:
                 parent_dir = app_path.parent
                 
                 is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
-                # 如果处于随机隔离沙盒，基础工作空间无痕重定向到系统临时目录，保障缓存与日志读写顺畅
                 if is_translocation:
                     return Path(tempfile.gettempdir())
                 return parent_dir
@@ -78,7 +77,6 @@ CACHE_FILE = BASE_DIR / "rules.cache.json"
 class ResourceManager:
     @staticmethod
     def initialize():
-        # 在独立的动态多通道加载中处理，此处保持空置以优化初始化效率
         pass
 
     @staticmethod
@@ -113,7 +111,6 @@ class ResourceManager:
         rules = {}
         possible_files = []
         
-        # 1. 动态探测优先级通道一：程序同级物理目录（适合正常解压/未被随机转位的环境）
         if getattr(sys, 'frozen', False):
             if sys.platform == 'darwin':
                 exec_dir = Path(sys.executable).parent
@@ -123,20 +120,21 @@ class ResourceManager:
         else:
             possible_files.append(Path(__file__).resolve().parent / "custom-domains.conf")
             
-        # 2. 👑 动态探测优先级通道二（100% 可行方案）：用户全局公共“文稿”安全通道
         docs_dir = Path.home() / "Documents" / "浏览器痕迹分析配置"
         docs_conf = docs_dir / "custom-domains.conf"
         possible_files.append(docs_conf)
         
-        # 自动在文稿下释放默认配置文件，方便需要扩展规则的用户随时编辑
         if not docs_conf.exists():
             try:
                 docs_dir.mkdir(parents=True, exist_ok=True)
                 docs_conf.write_text(
                     "# 专项规则库 (自定义扩展区)\n"
                     "# 💡 【macOS 用户提示】\n"
-                    "# 由于 Mac 的安全隔离机制，软件可能无法读取与 App 放在同一文件夹下的配置文件。\n"
-                    "# 请直接在这里修改或粘贴您的自定义规则，软件 100% 优先读取此处的规则。\n"
+                    "# 软件会优先尝试读取 App 同目录下的 custom-domains.conf。\n"
+                    "# 由于 macOS 的 App Translocation（应用随机转位）安全机制，在某些情况下程序实际运行路径会被系统重定向，\n"
+                    "# 导致可能无法访问放置在 .app 旁边的配置文件。\n"
+                    "# 为确保规则库始终可用，软件会自动在本目录（文稿/Documents/浏览器痕迹分析配置/）下维护一份配置文件。\n"
+                    "# 您只需修改或粘贴自定义规则至此，后续扫描时即可自动加载、增量合并并生效。\n"
                     "# ------------------------------------------------\n"
                     "# 格式范例：\n"
                     "# example.com=自定义分类\n", 
@@ -145,35 +143,28 @@ class ResourceManager:
             except Exception:
                 pass
 
-        # 遍历探测通道，加载首个有效存在的文件
-        target_file = None
+        server_pattern = re.compile(r"^server=/([^/]+)/")
         for f in possible_files:
             if f and f.exists():
-                target_file = f
-                break
-                
-        if target_file:
-            try:
-                server_pattern = re.compile(r"^server=/([^/]+)/")
-                with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"): continue
-                        if line.startswith("server="):
-                            match = server_pattern.match(line)
-                            if match:
-                                domain = match.group(1).strip().lower()
-                                if len(domain) >= 4 and "." in domain:
-                                    rules[domain] = "专项审计目标"
-                        elif "=" in line:
-                            k, v = line.split("=", 1)
-                            k = k.strip().lower()
-                            if "." in k:
-                                rules[k] = v.strip()
-            except Exception as e:
-                logger.error(f"解析外部规则库异常 [{target_file}]: {e}")
+                try:
+                    with open(f, 'r', encoding='utf-8', errors='ignore') as file_handler:
+                        for line in file_handler:
+                            line = line.strip()
+                            if not line or line.startswith("#"): continue
+                            if line.startswith("server="):
+                                match = server_pattern.match(line)
+                                if match:
+                                    domain = match.group(1).strip().lower()
+                                    if len(domain) >= 4 and "." in domain:
+                                        rules[domain] = "专项审计目标"
+                            elif "=" in line:
+                                k, v = line.split("=", 1)
+                                k = k.strip().lower()
+                                if "." in k:
+                                    rules[k] = v.strip()
+                except Exception as e:
+                    logger.error(f"解析外部规则库异常 [{f}]: {e}")
 
-        # 3. 通道三（终极工业兜底）：将内置硬编码规则无缝合并，确保任何环境下规则库永不为空
         for k, v in DEFAULT_INTERNAL_RULES.items():
             if k not in rules:
                 rules[k] = v
@@ -437,13 +428,10 @@ class ScannerCore:
             
             parts = domain.split('.')
             
-            # 🔥【第一道防线：白名单强效过滤】
-            # 任何传统 Google 核心及底噪域在此处阻断返回，绝不列入结果
             for i in range(len(parts)):
                 if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
                     return 
 
-            # 🛡️【第二道防线：专项审计规则比对】
             for i in range(len(parts)):
                 sub_domain = ".".join(parts[i:])
                 if "." in sub_domain and sub_domain in rule_dict:
@@ -460,11 +448,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("浏览器痕迹分析") 
-        self.geometry("460x220")
+        self.geometry("460x170") # 👑 去掉按钮后，窗口高度调小，界面更紧凑
         self.resizable(False, False)
         
         self.all_hits = []
-        self.current_report_path = None
         self.is_scanning = False 
         
         ResourceManager.initialize()
@@ -485,10 +472,9 @@ class App(tk.Tk):
 
         btn_box = tk.Frame(self)
         btn_box.pack(fill=tk.X, padx=15, pady=5)
+        # 👑 只保留一个“开始检测”按钮，实现完全单键自动化
         self.btn_run = tk.Button(btn_box, text="🚀 开始检测", command=self.pre_run_check, font=("Arial", 10, "bold"), height=2)
-        self.btn_run.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.btn_export = tk.Button(btn_box, text="打开网页结果", command=self.open_current_html, font=("Arial", 10), height=2, state="disabled")
-        self.btn_export.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
+        self.btn_run.pack(fill=tk.X, expand=True)
 
         self.pbar = ttk.Progressbar(self, mode='determinate')
         self.pbar.pack(fill=tk.X, padx=15, pady=(10, 0))
@@ -500,14 +486,8 @@ class App(tk.Tk):
 
     def run(self):
         self.btn_run.config(state="disabled")
-        self.btn_export.config(state="disabled")
         self.all_hits.clear()
         self.is_scanning = True
-        
-        if self.current_report_path:
-            try: Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception: pass
-            self.current_report_path = None
         
         rules = ResourceManager.load_audit_rules()
 
@@ -539,7 +519,10 @@ class App(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def generate_html_file(self) -> Optional[str]:
+    def execute_instant_report(self):
+        """👑 终极无痕闭环：生成、唤醒渲染、0.5秒内立刻物理粉碎文件"""
+        if not self.all_hits: return
+
         report_dir = Path(tempfile.gettempdir())
         file_name = f"Browser_Audit_Report_{time.time_ns()}.html"
         target_path = report_dir / file_name
@@ -576,38 +559,28 @@ class App(tk.Tk):
         html_content.append("</table></div></body></html>")
         
         try:
+            # 1. 物理写入临时目录
             with open(target_path, "w", encoding="utf-8") as f: 
                 f.write("".join(html_content))
-            return str(target_path)
+            
+            # 2. 立刻唤醒系统默认浏览器进行内存加载渲染
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(target_path)])
+            else:
+                webbrowser.open(target_path.as_uri())
+            
+            # 3. 👑 强力擦除：给浏览器系统 500 毫秒读取网页内容的时间，随后立刻删除文件（阅后即焚）
+            def shredder():
+                time.sleep(0.5)
+                try:
+                    if target_path.exists():
+                        target_path.unlink()
+                except Exception:
+                    pass
+            threading.Thread(target=shredder, daemon=True).start()
+            
         except Exception as e:
-            logger.error(f"HTML报告文件生成失败: {e}")
-            messagebox.showerror("写入报告失败", f"无法生成报告文件:\n{e}")
-            return None
-
-    def open_current_html(self):
-        if self.current_report_path and os.path.exists(self.current_report_path):
-            logger.info(f"准备打开报告: {self.current_report_path}")
-            try:
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", str(self.current_report_path)])
-                else:
-                    uri = Path(self.current_report_path).as_uri()
-                    webbrowser.open(uri)
-                
-                # 🔥 取证级【阅后即焚线程】：延时 2 秒后强行彻底销毁临时文件痕迹
-                def delay_destroy():
-                    time.sleep(2)  
-                    try:
-                        if self.current_report_path and os.path.exists(self.current_report_path):
-                            os.unlink(self.current_report_path)
-                            self.current_report_path = None
-                    except Exception:
-                        pass
-                threading.Thread(target=delay_destroy, daemon=True).start()
-                    
-            except Exception as e:
-                logger.error(f"打开报告文件异常: {e}")
-                messagebox.showerror("打开浏览器失败", f"无法自动唤醒浏览器:\n{self.current_report_path}")
+            logger.error(f"无痕生成调用流异常: {e}")
 
     def _process_queue(self):
         try:
@@ -628,13 +601,9 @@ class App(tk.Tk):
                     self.all_hits = val
                     
                     if self.all_hits:
-                        self.current_report_path = self.generate_html_file()
-                        if self.current_report_path:
-                            self.status_lbl.config(text="完成！报告已无痕生成并成功调用。")
-                            self.btn_export.config(state="normal")
-                            self.after(300, self.open_current_html)
-                        else:
-                            self.status_lbl.config(text="报告生成失败，请检查读写权限。")
+                        # 👑 检测完成直接无痕执行结果展现并立即物理擦除文件，不给临时目录留任何可驻留机会
+                        self.execute_instant_report()
+                        self.status_lbl.config(text="完成！分析结果已无痕渲染。")
                     else:
                         self.status_lbl.config(text="扫描完成：未发现符合规则的留痕。")
                         messagebox.showinfo("检测结果", "未检测到任何匹配的交互历史。")
@@ -647,9 +616,6 @@ class App(tk.Tk):
 
     def on_exit(self):
         self.is_scanning = False 
-        if self.current_report_path:
-            try: Path(self.current_report_path).unlink(missing_ok=True)
-            except Exception: pass
         try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
         except Exception: pass
         self.destroy()
