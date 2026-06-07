@@ -38,7 +38,6 @@ def get_base_directory() -> Path:
     if getattr(sys, 'frozen', False):
         if sys.platform == 'darwin':
             exec_dir = Path(sys.executable).parent
-            # 严谨的结构判定：确保真的是在 .app 内部
             if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
                 app_path = exec_dir.parent.parent
                 parent_dir = app_path.parent
@@ -46,7 +45,6 @@ def get_base_directory() -> Path:
                 is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
                 target_conf = parent_dir / "custom-domains.conf"
                 
-                # 如果处于隔离沙盒，或者同级配置文件根本不存在，退回安全目录
                 if is_translocation or not target_conf.exists():
                     safe_dir = Path.home() / ".browser_audit"
                     safe_dir.mkdir(parents=True, exist_ok=True)
@@ -55,7 +53,7 @@ def get_base_directory() -> Path:
                         "warning", 
                         "【macOS 安全隔離提示】\n"
                         "檢測到程序正處於隨機唯讀沙盒中，或無法讀取同級配置。\n\n"
-                        "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個資料夾拖移到「應用程序 (Applications)」，或移動到其他任意新目錄後重新打開！\n\n"
+                        "【解決辦法】：請在 Finder 中將「瀏覽器痕跡分析.app」整個資料夾拖移到「應用程序 (Applications)」，或移動到其他任意新目錄后重新打開！\n\n"
                         "否則程序將無法讀取自訂規則庫。"
                     ))
                     return safe_dir
@@ -433,7 +431,7 @@ class ScannerCore:
             pass
 
 # =================================================
-# 3. GUI 控制台
+# 3. GUI 控制台 (彻底去除弹窗、无痕阅后即焚版)
 # =================================================
 class App(tk.Tk):
     def __init__(self):
@@ -449,6 +447,7 @@ class App(tk.Tk):
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
         self.queue = queue.Queue()
+        
         self.core_temp_dir = Path(tempfile.mkdtemp(prefix="audit_core_"))
         
         self._build_ui()
@@ -475,10 +474,7 @@ class App(tk.Tk):
         self.status_lbl.pack(padx=15, anchor="w", pady=5)
 
     def pre_run_check(self):
-        running = ResourceManager.is_browser_running()
-        if running:
-            browsers = ", ".join(running).title()
-            if not messagebox.askokcancel("提取提示", f"检测到 {browsers} 正在运行。\n系统将采用热备方案安全提取，是否继续？"): return
+        # 🔥 【核心改动】：移除所有运行检测弹窗，直接静默开始分析
         self.run()
 
     def run(self):
@@ -486,6 +482,13 @@ class App(tk.Tk):
         self.btn_export.config(state="disabled")
         self.all_hits.clear()
         self.is_scanning = True
+        
+        if self.current_report_path:
+            try:
+                Path(self.current_report_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.current_report_path = None
         
         rules = ResourceManager.load_audit_rules()
         if not rules:
@@ -523,17 +526,11 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def generate_html_file(self) -> Optional[str]:
-        # 直接使用程序所在的运行路径，不扫描任何用户个人文件夹
-        report_dir = BASE_DIR
+        report_dir = Path(tempfile.gettempdir())
         
-        # 安全防御：如果目录不可写（如权限受限），自动重定向到系统临时目录
-        if not os.access(report_dir, os.W_OK):
-            report_dir = Path(tempfile.gettempdir())
-        
-        file_name = f"Browser_Audit_Report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
+        file_name = f"Browser_Audit_Report_{time.time_ns()}.html"
         target_path = report_dir / file_name
         
-        # 3. 数据去重处理
         unique_hits = []
         seen = set()
         for h in self.all_hits:
@@ -583,9 +580,21 @@ class App(tk.Tk):
                 else:
                     uri = Path(self.current_report_path).as_uri()
                     webbrowser.open(uri)
+                
+                # 打开网页后即刻无痕销毁文件
+                def delay_destroy():
+                    time.sleep(2)  
+                    try:
+                        if self.current_report_path and os.path.exists(self.current_report_path):
+                            os.unlink(self.current_report_path)
+                            self.current_report_path = None
+                    except Exception:
+                        pass
+                threading.Thread(target=delay_destroy, daemon=True).start()
+                    
             except Exception as e:
                 logger.error(f"打开报告文件异常: {e}")
-                messagebox.showerror("打开浏览器失败", f"无法自动唤醒浏览器，请手动打开:\n{self.current_report_path}")
+                messagebox.showerror("打开浏览器失败", f"无法自动唤醒浏览器:\n{self.current_report_path}")
 
     def _process_queue(self):
         try:
@@ -608,7 +617,7 @@ class App(tk.Tk):
                     if self.all_hits:
                         self.current_report_path = self.generate_html_file()
                         if self.current_report_path:
-                            self.status_lbl.config(text="完成！报告已在程序同目录下生成。")
+                            self.status_lbl.config(text="完成！报告已无痕生成并准备打开。")
                             self.btn_export.config(state="normal")
                             self.after(300, self.open_current_html)
                         else:
@@ -625,8 +634,15 @@ class App(tk.Tk):
 
     def on_exit(self):
         self.is_scanning = False 
-        try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
-        except Exception: pass
+        if self.current_report_path:
+            try:
+                Path(self.current_report_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(self.core_temp_dir, ignore_errors=True)
+        except Exception:
+            pass
         self.destroy()
 
 if __name__ == "__main__":
