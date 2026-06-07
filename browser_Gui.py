@@ -253,7 +253,7 @@ class ScannerCore:
                     for sub in base.iterdir():
                         if sub.is_dir() and (sub / "History").exists():
                             profiles.append({"b": name, "p": sub.name, "path": str(sub), "type": "C"})
-                    except Exception: pass
+                except Exception: pass
             
             ff_mac = home / "Library/Application Support/Firefox/Profiles"
             if ff_mac.exists():
@@ -440,12 +440,12 @@ class ScannerCore:
             pass
 
 # =================================================
-# 3. GUI 控制台
+# 3. GUI 控制台 (无痕高稳定性重隔绝版)
 # =================================================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("浏览器痕迹 analysis") 
+        self.title("浏览器痕迹分析") 
         self.geometry("460x170") 
         self.resizable(False, False)
         
