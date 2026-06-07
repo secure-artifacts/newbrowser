@@ -33,34 +33,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def get_base_directory() -> Path:
-    # 1. 如果是打包后的运行环境
-    if getattr(sys, 'frozen', False):
-        exec_dir = Path(sys.executable).parent # 对应 macOS 内部的 Contents/MacOS
+    # 1. 源码直接调试运行模式
+    if not getattr(sys, 'frozen', False):
+        return Path(__file__).resolve().parent
+
+    # 2. 打包后的生产运行模式 (PyInstaller)
+    exec_path = Path(sys.executable).resolve()
+    candidates = []
+    
+    if sys.platform == 'darwin':
+        # 【最高优先级】：精准命中 .app 的外部物理同级目录
+        if len(exec_path.parents) >= 4:
+            candidates.append(exec_path.parents[3])
         
-        # 【最高优先级】：如果用户把 custom-domains.conf 放在了二进制程序 BrowserAudit 同级目录下
-        if (exec_dir / "custom-domains.conf").exists():
-            return exec_dir
+        # 【第二优先级】：防止误把文件塞进 .app 内部二进制同级
+        if len(exec_path.parents) >= 1:
+            candidates.append(exec_path.parent)
             
-        # 【次高优先级】：如果用户把 custom-domains.conf 放在了 浏览器痕迹分析.app 的外部同级目录下
-        if sys.platform == 'darwin' and exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
-            app_bundle_parent = exec_dir.parent.parent.parent
-            if (app_bundle_parent / "custom-domains.conf").exists():
-                return app_bundle_parent
-                
-        # 【第三顺位】：检查当前工作目录
-        if (Path.cwd() / "custom-domains.conf").exists():
-            return Path.cwd()
-            
-        # 默认绝对兜底：未找到时默认以 .app 的外层同级目录作为基准（用于自动初始化生成文件）
-        if sys.platform == 'darwin' and exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
-            return exec_dir.parent.parent.parent
-        return exec_dir
+        # 【第三优先级】：.app 内部 Contents 同级
+        if len(exec_path.parents) >= 3:
+            candidates.append(exec_path.parents[2])
+    else:
+        # Windows 平台的打包同级目录
+        candidates.append(exec_path.parent)
+
+    # 【第四优先级】：当前工作目录
+    candidates.append(Path.cwd())
+
+    # 按优先级无条件探测：只要找到 custom-domains.conf，就立刻锁定该目录
+    for candidate in candidates:
+        if (candidate / "custom-domains.conf").exists():
+            return candidate
+
+    # 3. 兜底初始化逻辑：若任何地方都没找到配置文件，则选择 .app 外部同级作为基准
+    if sys.platform == 'darwin' and len(exec_path.parents) >= 4:
+        target_dir = exec_path.parents[3]
+        # 如果该目录因系统原因完全不可写，静默切回家目录，绝不弹窗
+        if os.access(target_dir, os.W_OK):
+            return target_dir
         
-    # 2. 如果是源码直接调试运行 (python3 browser_Gui.py)
-    script_dir = Path(__file__).resolve().parent
-    if (script_dir / "custom-domains.conf").exists():
-        return script_dir
-    return Path.cwd()
+        safe_dir = Path.home() / ".browser_audit"
+        safe_dir.mkdir(parents=True, exist_ok=True)
+        return safe_dir
+
+    return exec_path.parent
 
 BASE_DIR = get_base_directory()
 CUSTOM_FILE = BASE_DIR / "custom-domains.conf"
@@ -180,8 +196,15 @@ class ScannerCore:
                 with open(target_main_db, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
             return target_main_db
+        except IOError as e:
+            msg = str(e).lower()
+            if "permission" in msg or "denied" in msg:
+                logger.warning(f"【权限受限】{db_path.name} 拒绝访问。")
+            else:
+                logger.error(f"流式提取失败: {db_path.name} -> {e}")
+            return None
         except Exception as e:
-            logger.debug(f"提取快照静默忽略: {db_path.name} -> {e}")
+            logger.error(f"提取快照异常: {db_path.name} -> {e}")
             return None
 
     @staticmethod
@@ -233,7 +256,7 @@ class ScannerCore:
                     for sub in base.iterdir():
                         if sub.is_dir() and (sub / "History").exists():
                             profiles.append({"b": name, "p": sub.name, "path": str(sub), "type": "C"})
-                    except Exception: pass
+                except Exception: pass
             
             ff_mac = home / "Library/Application Support/Firefox/Profiles"
             if ff_mac.exists():
@@ -287,7 +310,7 @@ class ScannerCore:
                             for (url,) in c_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
                     except sqlite3.OperationalError: pass
                     
-                except sqlite3.DatabaseError: pass
+                except sqlite3.DatabaseError as e: logger.debug(f"Chrome系DB异常: {e}")
                 finally:
                     if conn: conn.close()
                     if tmp_db:
@@ -337,7 +360,7 @@ class ScannerCore:
                             if not d_rows: break
                             for (url,) in d_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
                     except sqlite3.OperationalError: pass
-                except sqlite3.DatabaseError: pass
+                except sqlite3.DatabaseError as e: logger.debug(f"Firefox系DB异常: {e}")
                 finally:
                     if conn: conn.close()
                     if tmp_db:
@@ -376,7 +399,7 @@ class ScannerCore:
                             if not rows: break
                             for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
                         except Exception: break
-                except sqlite3.DatabaseError: pass
+                except sqlite3.DatabaseError as e: logger.debug(f"Safari DB异常: {e}")
                 finally:
                     if conn: conn.close()
                     if tmp_db:
@@ -395,7 +418,7 @@ class ScannerCore:
                             elif isinstance(node, list):
                                 for item in node: walk_safari(item)
                         walk_safari(plist_data)
-                except Exception: pass
+                except Exception as e: logger.debug(f"Safari Plist解析异常: {e}")
                     
         return hits
 
@@ -476,7 +499,7 @@ class App(tk.Tk):
         
         rules = ResourceManager.load_audit_rules()
         if not rules:
-            messagebox.showwarning("警告", "规则库为空或加载失败，请检查配置。")
+            messagebox.showwarning("警告", "规则库加载失败，请检查配置。")
             self.btn_run.config(state="normal")
             self.is_scanning = False
             return
@@ -554,6 +577,7 @@ class App(tk.Tk):
             return str(target_path)
         except Exception as e:
             logger.error(f"HTML报告文件生成失败: {e}")
+            messagebox.showerror("写入报告失败", f"无法生成报告文件:\n{e}")
             return None
 
     def open_current_html(self):
@@ -583,7 +607,7 @@ class App(tk.Tk):
                     if self.all_hits:
                         self.current_report_path = self.generate_html_file()
                         if self.current_report_path:
-                            self.status_lbl.config(text="完成！报告已成功输出。")
+                            self.status_lbl.config(text="完成！报告已在程序同目录下生成。")
                             self.btn_export.config(state="normal")
                             self.after(300, self.open_current_html)
                         else:
