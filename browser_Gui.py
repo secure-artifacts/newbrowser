@@ -446,7 +446,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("浏览器痕迹分析") 
-        self.geometry("460x170") 
+        
+        # 👑 仅针对 Windows 系统动态增加窗口高度，防止高 DPI 环境下底部标签被无情裁剪，Mac 保持精美原状
+        if sys.platform == 'win32':
+            self.geometry("460x210")
+        else:
+            self.geometry("460x170")
+            
         self.resizable(False, False)
         
         self.all_hits = []
