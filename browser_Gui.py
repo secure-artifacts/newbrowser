@@ -124,7 +124,6 @@ class ResourceManager:
             possible_files.append(Path(__file__).resolve().parent / "custom-domains.conf")
             
         # 2. 👑 动态探测优先级通道二（100% 可行方案）：用户全局公共“文稿”安全通道
-        # 彻底解决 macOS 隔离沙盒 (App Translocation) 导致无法读取本地同级文件的问题
         docs_dir = Path.home() / "Documents" / "浏览器痕迹分析配置"
         docs_conf = docs_dir / "custom-domains.conf"
         possible_files.append(docs_conf)
@@ -313,7 +312,7 @@ class ScannerCore:
                         cursor.execute("SELECT url FROM downloads_url_chains")
                         while True:
                             c_rows = cursor.fetchmany(5000)
-                            if not d_rows: break
+                            if not c_rows: break
                             for (url,) in c_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
                     except sqlite3.OperationalError: pass
                     
@@ -439,7 +438,7 @@ class ScannerCore:
             parts = domain.split('.')
             
             # 🔥【第一道防线：白名单强效过滤】
-            # 任何命中 google.com 结尾的流量，立刻静默返回，彻底剔除 Google 痕迹
+            # 任何传统 Google 核心及底噪域在此处阻断返回，绝不列入结果
             for i in range(len(parts)):
                 if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
                     return 
