@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 gui_warning_queue = queue.Queue()
 
-# 核心内置硬编码规则库：确保在 macOS 随机唯读沙盒等任何极端限制环境下，程序依然拥有 100% 的完备检测能力
+# 核心内置硬编码规则库
 DEFAULT_INTERNAL_RULES = {
     "heygen.com": "AI视频(HeyGen)",
     "hailuoai.com": "AI服务(海螺AI)",
@@ -101,7 +101,7 @@ class ResourceManager:
                     for b in browsers:
                         if b not in running:
                             if proc_name == b or proc_name.startswith(f"{b}."):
-                                        running.append(b)
+                                running.append(b)
         except Exception as e:
             logger.debug(f"进程检测异常: {e}")
         return running
@@ -391,11 +391,9 @@ class ScannerCore:
                         except sqlite3.OperationalError: pass
                         
                     while True:
-                        try:
-                            rows = cursor.fetchmany(5000)
-                            if not rows: break
-                            for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
-                        except Exception: break
+                        rows = cursor.fetchmany(5000)
+                        if not rows: break
+                        for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
                 except sqlite3.DatabaseError as e: logger.debug(f"Safari DB异常: {e}")
                 finally:
                     if conn: conn.close()
@@ -442,12 +440,12 @@ class ScannerCore:
             pass
 
 # =================================================
-# 3. GUI 控制台 (无痕高稳定性重隔绝版)
+# 3. GUI 控制台
 # =================================================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("浏览器痕迹分析") 
+        self.title("浏览器痕迹 analysis") 
         self.geometry("460x170") 
         self.resizable(False, False)
         
