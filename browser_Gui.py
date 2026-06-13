@@ -457,6 +457,7 @@ class App(tk.Tk):
         
         self.all_hits = []
         self.is_scanning = False 
+        self.generated_reports = []  # 🔒 统一跟踪所有生成的临时报告，用于生命周期结束时完美物理删除
         
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -568,14 +569,8 @@ class App(tk.Tk):
             else:
                 webbrowser.open(target_path.as_uri())
             
-            def shredder():
-                time.sleep(0.5)
-                try:
-                    if target_path.exists():
-                        target_path.unlink()
-                except Exception:
-                    pass
-            threading.Thread(target=shredder, daemon=True).start()
+            # 🔒 完美的生命周期锁绑定：将生成的文件加入延迟销毁列表中，代替0.5秒盲等粉碎，解决多浏览器和文件重定向冲突
+            self.generated_reports.append(target_path)
             
         except Exception as e:
             logger.error(f"无痕生成调用流异常: {e}")
@@ -613,6 +608,16 @@ class App(tk.Tk):
 
     def on_exit(self):
         self.is_scanning = False 
+        
+        # 🔒 窗口退出前的绝对销毁：遍历生命周期内产生的所有临时报告，将其执行彻底的物理删除，干净程度完全一致
+        if hasattr(self, 'generated_reports'):
+            for report_path in self.generated_reports:
+                try:
+                    if report_path.exists():
+                        report_path.unlink()
+                except Exception:
+                    pass
+                    
         try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
         except Exception: pass
         self.destroy()
