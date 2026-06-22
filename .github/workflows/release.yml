@@ -1,10 +1,8 @@
 name: Build and Release with Attestation
-
 on:
   push:
     tags:
       - 'v*'
-
 jobs:
   build:
     strategy:
@@ -14,25 +12,17 @@ jobs:
           - os: windows-latest
             os_label: Windows_x64_普通电脑版
             asset_name: newbrowser-windows
-
-          - os: windows-latest
-            os_label: Win_ARM64_高通骁龙本专用包
-            asset_name: newbrowser-arm64
-
-          - os: macos-latest
+          - os: macos-latest        # M1/M2/M3 芯片 Runner
             os_label: macOS_M芯片新款
             asset_name: newbrowser-macos
-
-          - os: macos-latest
+          - os: macos-13            # 最后一个 Intel x86_64 Runner
             os_label: Mac_Intel_老款电脑专用包
             asset_name: newbrowser-intel
-
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write
       contents: read
       attestations: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -43,7 +33,9 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install pyinstaller
+          pip install -r requirements.txt
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -51,33 +43,29 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
-          
+
           $folderName = "浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           $stage = "dist_final/$folderName"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          
+
           Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
           Copy-Item "custom-domains.conf" "$stage/" -Force
-          
+
           Compress-Archive -Path $stage -DestinationPath "dist_final/${{ matrix.asset_name }}-${{ github.ref_name }}.zip" -Force
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          if [ "${{ matrix.asset_name }}" == "newbrowser-intel" ]; then
-              pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --target-arch x86_64 --clean --noconfirm
-          else
-              pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
-          fi
-          
+          # Intel 包在 macos-13 Runner 上原生构建，无需 --target-arch 交叉编译
+          pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
+
           folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           stage="dist_final/${folder_name}"
           mkdir -p "$stage"
-          
-          # 【纯净打包】：直接拷贝 .app 和配置文件并排，绝不修改 .app 内部文件，杜绝一切签名报错！
+
           cp -r dist/BrowserAudit.app "$stage/浏览器痕迹分析.app"
           cp custom-domains.conf "$stage/"
-          
+
           cd dist_final
           zip -r "${{ matrix.asset_name }}-${{ github.ref_name }}.zip" "${folder_name}"
 
@@ -97,7 +85,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
