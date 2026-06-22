@@ -15,10 +15,6 @@ jobs:
             os_label: Windows_x64_普通电脑版
             asset_name: newbrowser-windows
 
-          - os: windows-11-arm
-            os_label: Win_ARM64_高通骁龙本专用包
-            asset_name: newbrowser-arm64
-
           - os: macos-latest        # M1/M2/M3 芯片 Runner (arm64)
             os_label: macOS_M芯片新款
             asset_name: newbrowser-macos
