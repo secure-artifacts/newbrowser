@@ -18,12 +18,12 @@ from datetime import datetime
 from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 
 # =================================================
 # 0. 全局配置与高级日志配置
 # =================================================
-CACHE_VERSION = 9
+CACHE_VERSION = 11.6  # 标记 v1.1.6 专版内核
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +62,6 @@ def get_base_directory() -> Path:
             if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
                 app_path = exec_dir.parent.parent
                 parent_dir = app_path.parent
-                
                 is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
                 if is_translocation:
                     return Path(tempfile.gettempdir())
@@ -95,13 +94,12 @@ class ResourceManager:
                     text=True,
                     errors="ignore"
                 ).splitlines()
-                
                 for line in tasks_raw:
                     proc_name = Path(line.strip()).name.lower()
                     for b in browsers:
                         if b not in running:
                             if proc_name == b or proc_name.startswith(f"{b}."):
-                                        running.append(b)
+                                running.append(b)
         except Exception as e:
             logger.debug(f"进程检测异常: {e}")
         return running
@@ -180,12 +178,252 @@ class ScannerCore:
         "apple.com", "icloud.com", "microsoft.com", "bing.com", "msn.com"
     })
 
+    # 仅跳过真正的系统级噪音目录，不屏蔽任何用户数据目录
+    # ⚠️ 注意：故意移除了 documents/downloads/videos/music/pictures，
+    #    因为 WTG 用户常将便携浏览器放在这些目录下，屏蔽会造成漏检
+    _SKIP_DIRS = frozenset({
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "recovery",
+        "$recycle.bin",
+        "system volume information",
+        "perflogs",
+        "intel",
+        "amd",
+        "nvidia",
+        "msocache",
+    })
+
+    @staticmethod
+    def _get_current_username() -> str:
+        """安全获取当前用户名，兼容 WTG / 服务账户等边缘环境。"""
+        try:
+            return os.getlogin()
+        except Exception:
+            pass
+        for env_key in ("USERNAME", "USER", "LOGNAME"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val
+        return Path.home().name
+
+    @staticmethod
+    def _get_windows_drives() -> List[Path]:
+        """枚举 Windows 当前所有已挂载、可访问的盘符。"""
+        drives = []
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            candidate = Path(f"{letter}:\\")
+            try:
+                if candidate.is_dir():
+                    drives.append(candidate)
+            except (OSError, PermissionError):
+                pass
+        return drives
+
+    @staticmethod
+    def _is_valid_user_data(path: Path) -> bool:
+        """
+        通过特征指纹判定是否为合法的 Chrome/Edge 系 User Data 根目录。
+        条件：目录下至少存在一个含 History 文件的子目录（即至少一个 Profile 分身）。
+        """
+        if not path.is_dir():
+            return False
+        try:
+            for sub in path.iterdir():
+                if sub.is_dir() and (sub / "History").exists():
+                    return True
+        except (PermissionError, OSError):
+            pass
+        return False
+
+    @staticmethod
+    def _infer_browser_name(user_data_path: Path, fallback: str = "Chrome(外置)") -> str:
+        """
+        通过路径关键字 + 内部文件特征，安全地推断外置 Chromium 系浏览器的具体名称。
+        所有 iterdir() 操作均有 try/except 保护，不会因权限问题中断上层流程。
+        """
+        path_str = str(user_data_path).lower()
+        if "edge" in path_str:
+            return "Edge(外置)"
+        if "brave" in path_str:
+            return "Brave(外置)"
+        if "chrome" in path_str:
+            return "Chrome(外置)"
+
+        # 路径名无法判断时，进一步检查内部文件特征区分 Edge vs Chrome
+        # Edge 的 User Data 根下通常有 Edge-specific 的配置文件
+        default_dir = user_data_path / "Default"
+        if (default_dir / "Edge Preferences").exists():
+            return "Edge(外置)"
+
+        # 检查根目录下的 .json/.dat 文件名是否含 edge 关键字
+        try:
+            for f in user_data_path.iterdir():
+                if f.is_file() and f.suffix in (".json", ".dat"):
+                    if "edge" in f.name.lower():
+                        return "Edge(外置)"
+        except (PermissionError, OSError):
+            pass
+
+        return fallback
+
+    @staticmethod
+    def _collect_chrome_profiles(base: Path, browser_name: str,
+                                  seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """从 User Data 根目录中枚举所有有效的 Profile 分身并去重。"""
+        found = []
+        try:
+            for sub in base.iterdir():
+                if not sub.is_dir():
+                    continue
+                if not (sub / "History").exists():
+                    continue
+                try:
+                    real_path = str(sub.resolve())
+                except OSError:
+                    real_path = str(sub)
+                if real_path in seen_paths:
+                    continue
+                seen_paths.add(real_path)
+                found.append({
+                    "b": browser_name,
+                    "p": sub.name,
+                    "path": str(sub),
+                    "type": "C"
+                })
+        except (PermissionError, OSError) as e:
+            logger.debug(f"枚举 Profile 分身受限 [{base}]: {e}")
+        return found
+
+    @staticmethod
+    def _win_scan_standard_paths(drives: List[Path], username: str,
+                                  seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """策略一：全盘符标准路径高速扫描，精准命中常规安装场景。"""
+        profiles = []
+        standard_defs = [
+            (f"Users\\{username}\\AppData\\Local\\Google\\Chrome\\User Data",            "Chrome"),
+            (f"Users\\{username}\\AppData\\Local\\Microsoft\\Edge\\User Data",           "Edge"),
+            (f"Users\\{username}\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data", "Brave"),
+            (f"Users\\{username}\\AppData\\Local\\360chromeX\\Chrome\\User Data",        "360极速X"),
+            (f"Users\\{username}\\AppData\\Local\\Packages\\TheBrowserCompany.Arc_tchbfspa9nw8p\\LocalCache\\Local\\Arc\\User Data", "Arc"),
+        ]
+        for drive in drives:
+            for rel_path, bname in standard_defs:
+                base = drive / rel_path
+                if ScannerCore._is_valid_user_data(base):
+                    profiles.extend(
+                        ScannerCore._collect_chrome_profiles(base, bname, seen_paths)
+                    )
+        return profiles
+
+    @staticmethod
+    def _win_scan_firefox_standard(drives: List[Path], username: str,
+                                    seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """
+        Firefox 全盘符标准 Roaming 路径扫描。
+        覆盖 WTG 场景：系统盘变更后 Roaming 路径的盘符前缀也随之变化。
+        """
+        profiles = []
+        for drive in drives:
+            ff_base = drive / f"Users\\{username}\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles"
+            if not ff_base.exists():
+                continue
+            try:
+                for sub in ff_base.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    if not (sub / "places.sqlite").exists():
+                        continue
+                    try:
+                        real_path = str(sub.resolve())
+                    except OSError:
+                        real_path = str(sub)
+                    if real_path in seen_paths:
+                        continue
+                    seen_paths.add(real_path)
+                    profiles.append({
+                        "b": "Firefox", "p": sub.name,
+                        "path": str(sub), "type": "F"
+                    })
+            except (PermissionError, OSError) as e:
+                logger.debug(f"Firefox 标准路径枚举受限 [{ff_base}]: {e}")
+        return profiles
+
+    @staticmethod
+    def _win_scan_shallow_nonstandard(drives: List[Path],
+                                       seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """
+        策略二：全盘符浅层非标准路径穿透扫描（深度 ≤ 3 层）。
+
+        专为以下场景设计：
+          · WTG (Windows To Go) 外置系统盘数据遗留
+          · 用户手动将 User Data / Profile 重定向至 D 盘
+          · 绿色便携版浏览器（Chrome Portable / Firefox Portable）
+          · 第三方一键搬家工具生成的非标准路径
+
+        深度 3 层可覆盖：
+          D:\\User Data\\Default\\               ← 深度1进入，深度2命中
+          D:\\Tools\\Chrome\\User Data\\Default  ← 深度1→2→3命中
+        """
+        profiles = []
+
+        def _scan_dir(current: Path, depth: int):
+            if depth > 3:
+                return
+            try:
+                entries = list(current.iterdir())
+            except (PermissionError, OSError):
+                return
+
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                name_lower = entry.name.lower()
+                # 跳过纯系统噪音目录，用户数据目录（documents/downloads等）保留扫描
+                if name_lower in ScannerCore._SKIP_DIRS or name_lower.startswith("$"):
+                    continue
+
+                # ── Firefox 外置便携版：通过 places.sqlite 特征识别单个 Profile 目录 ──
+                if (entry / "places.sqlite").exists():
+                    try:
+                        real_path = str(entry.resolve())
+                    except OSError:
+                        real_path = str(entry)
+                    if real_path not in seen_paths:
+                        seen_paths.add(real_path)
+                        profiles.append({
+                            "b": "Firefox(外置)", "p": entry.name,
+                            "path": str(entry), "type": "F"
+                        })
+                    # 已识别为 Firefox Profile，无需继续向内递归
+                    continue
+
+                # ── Chromium 系外置：通过 History 子目录特征识别 User Data 根 ──
+                if ScannerCore._is_valid_user_data(entry):
+                    # ✅ 使用独立方法推断浏览器名，内含完整异常保护
+                    bname = ScannerCore._infer_browser_name(entry)
+                    profiles.extend(
+                        ScannerCore._collect_chrome_profiles(entry, bname, seen_paths)
+                    )
+                    # 已识别为 User Data 根，无需继续向内递归（避免重复计入子 Profile）
+                    continue
+
+                # 两种特征均未命中，继续向下递归搜索
+                _scan_dir(entry, depth + 1)
+
+        for drive in drives:
+            _scan_dir(drive, 1)
+
+        return profiles
+
     @staticmethod
     def _snapshot_database(db_path: Path, temp_dir: Path) -> Optional[Path]:
-        if not db_path.exists(): return None
+        if not db_path.exists():
+            return None
         snap_name = f"audit_db_{time.time_ns()}.db"
         target_main_db = temp_dir / snap_name
-        
         try:
             with open(db_path, "rb") as f_in:
                 with open(target_main_db, "wb") as f_out:
@@ -195,7 +433,9 @@ class ScannerCore:
             msg = str(e).lower()
             if "permission" in msg or "denied" in msg:
                 if "safari" in str(db_path).lower():
-                    gui_warning_queue.put(("warning", f"【系统沙盒拦截】无法提取 Safari 数据库：\n{db_path.name}\n\n解决办法：请前往「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」，允许本程序。"))
+                    gui_warning_queue.put(("warning",
+                        f"【系统沙盒拦截】无法提取 Safari 数据库：\n{db_path.name}\n\n"
+                        "解决办法：请前往「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」，允许本程序。"))
                 logger.warning(f"【权限受限】{db_path.name} 拒绝访问。")
             else:
                 logger.error(f"流式提取失败: {db_path.name} -> {e}")
@@ -207,37 +447,36 @@ class ScannerCore:
     @staticmethod
     def get_profiles() -> List[Dict[str, str]]:
         profiles = []
-        if sys.platform == 'win32':
-            local, appdata = os.getenv('LOCALAPPDATA', ''), os.getenv('APPDATA', '')
-            if local:
-                c_browsers = {
-                    "Chrome": Path(local) / "Google" / "Chrome" / "User Data",
-                    "Edge": Path(local) / "Microsoft" / "Edge" / "User Data",
-                    "Brave": Path(local) / "BraveSoftware" / "Brave-Browser" / "User Data",
-                    "360极速X": Path(local) / "360chromeX" / "Chrome" / "User Data",
-                    "Arc": Path(local) / "Packages" / "TheBrowserCompany.Arc_tchbfspa9nw8p" / "LocalCache" / "Local" / "Arc" / "User Data"
-                }
-                for name, base in c_browsers.items():
-                    if not base.exists(): continue
-                    try:
-                        for sub in base.iterdir():
-                            if sub.is_dir() and (sub / "History").exists():
-                                profiles.append({"b": name, "p": sub.name, "path": str(sub), "type": "C"})
-                    except Exception: pass
-            
-            if appdata:
-                ff_base = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
-                if ff_base.exists():
-                    try:
-                        for sub in ff_base.iterdir():
-                            if sub.is_dir() and (sub / "places.sqlite").exists():
-                                profiles.append({"b": "Firefox", "p": sub.name, "path": str(sub), "type": "F"})
-                    except Exception: pass
 
+        # ── Windows 全盘符主动智能穿透 ───────────────────────────────────────────
+        if sys.platform == 'win32':
+            seen_paths: Set[str] = set()
+            username = ScannerCore._get_current_username()
+            drives = ScannerCore._get_windows_drives()
+
+            logger.info(f"[Win] 智能枚举盘符: {[str(d) for d in drives]}，当前取证用户映射: {username}")
+
+            # 策略一：Chromium 系标准路径高速扫描
+            std_profiles = ScannerCore._win_scan_standard_paths(drives, username, seen_paths)
+            profiles.extend(std_profiles)
+            logger.info(f"[Win] Chromium 标准路径命中 {len(std_profiles)} 个 Profile")
+
+            # 策略一-B：Firefox 全盘符标准 Roaming 路径扫描
+            ff_std_profiles = ScannerCore._win_scan_firefox_standard(drives, username, seen_paths)
+            profiles.extend(ff_std_profiles)
+            logger.info(f"[Win] Firefox 标准路径命中 {len(ff_std_profiles)} 个 Profile")
+
+            # 策略二：浅层非标准路径穿透（WTG/D盘重定向/便携版全覆盖）
+            ext_profiles = ScannerCore._win_scan_shallow_nonstandard(drives, seen_paths)
+            profiles.extend(ext_profiles)
+            logger.info(f"[Win] 非标准路径穿透命中 {len(ext_profiles)} 个 Profile")
+
+            logger.info(f"[Win] 全盘扫描就绪：共锁定 {len(profiles)} 个独立浏览器配置分身")
+
+        # ── macOS（精美保留原逻辑，零改动）────────────────────────────────────
         elif sys.platform == 'darwin':
             home = Path.home()
             safari_path = home / "Library/Safari"
-            
             if (safari_path / "History.db").exists() or (safari_path / "Bookmarks.plist").exists():
                 profiles.append({"b": "Safari", "p": "MainSystem", "path": str(safari_path), "type": "S"})
             
@@ -248,12 +487,14 @@ class ScannerCore:
                 "Arc": home / "Library/Application Support/Arc/User Data"
             }
             for name, base in mac_paths.items():
-                if not base.exists(): continue
+                if not base.exists():
+                    continue
                 try:
                     for sub in base.iterdir():
                         if sub.is_dir() and (sub / "History").exists():
                             profiles.append({"b": name, "p": sub.name, "path": str(sub), "type": "C"})
-                except Exception: pass
+                except Exception:
+                    pass
             
             ff_mac = home / "Library/Application Support/Firefox/Profiles"
             if ff_mac.exists():
@@ -261,14 +502,14 @@ class ScannerCore:
                     for sub in ff_mac.iterdir():
                         if sub.is_dir() and (sub / "places.sqlite").exists():
                             profiles.append({"b": "Firefox", "p": sub.name, "path": str(sub), "type": "F"})
-                except Exception: pass
-                
+                except Exception:
+                    pass
+
         return profiles
 
     @staticmethod
     def scan(profile: Dict[str, str], rule_dict: Dict[str, str], temp_dir: Path) -> List[Tuple]:
         hits = []
-        
         if profile["type"] == "C":
             profile_path = Path(profile["path"])
             db_path = profile_path / "History"
@@ -306,7 +547,6 @@ class ScannerCore:
                             if not c_rows: break
                             for (url,) in c_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
                     except sqlite3.OperationalError: pass
-                    
                 except sqlite3.DatabaseError as e: logger.debug(f"Chrome系DB异常: {e}")
                 finally:
                     if conn: conn.close()
@@ -423,31 +663,25 @@ class ScannerCore:
         try:
             domain = urlparse(url).netloc.lower() if url.startswith('http') else url.lower()
             if ":" in domain: domain = domain.split(":")[0]
-            
             parts = domain.split('.')
-            
             for i in range(len(parts)):
-                if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET:
-                    return 
-
+                if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET: return 
             for i in range(len(parts)):
                 sub_domain = ".".join(parts[i:])
                 if "." in sub_domain and sub_domain in rule_dict:
                     hits.append((profile["b"], profile["p"], info_type, rule_dict[sub_domain], url))
                     return 
-
         except Exception:
             pass
 
 # =================================================
-# 3. GUI 控制台 (无痕高稳定性重隔绝版)
+# 3. GUI 控制台 (无痕高稳定性重隔绝正式发布版)
 # =================================================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("浏览器痕迹分析") 
+        self.title("浏览器痕迹分析 v1.1.6")
         
-        # 👑 仅针对 Windows 系统动态增加窗口高度，防止高 DPI 环境下底部标签被无情裁剪，Mac 保持精美原状
         if sys.platform == 'win32':
             self.geometry("460x210")
         else:
@@ -457,7 +691,7 @@ class App(tk.Tk):
         
         self.all_hits = []
         self.is_scanning = False 
-        self.generated_reports = []  # 🔒 统一跟踪所有生成的临时报告，用于生命周期结束时完美物理删除
+        self.generated_reports = []  # 🔒 统一生命周期锁：用于最终强力物理蒸发
         
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -472,7 +706,7 @@ class App(tk.Tk):
         header.pack(fill=tk.X, padx=15)
         title_box = tk.Frame(header)
         title_box.pack(side=tk.LEFT)
-        tk.Label(title_box, text="TRACE ANALYZER", font=("Arial", 8, "bold"), fg="#ff4d4f").pack(anchor="w")
+        tk.Label(title_box, text="TRACE AUDITOR PRO", font=("Arial", 8, "bold"), fg="#ff4d4f").pack(anchor="w")
         tk.Label(title_box, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
 
         btn_box = tk.Frame(self)
@@ -482,7 +716,7 @@ class App(tk.Tk):
 
         self.pbar = ttk.Progressbar(self, mode='determinate')
         self.pbar.pack(fill=tk.X, padx=15, pady=(10, 0))
-        self.status_lbl = tk.Label(self, text="系统就绪，等待运行...", fg="#666", font=("Arial", 9))
+        self.status_lbl = tk.Label(self, text="系统就绪，全盘智能审计通道已就绪...", fg="#666", font=("Arial", 9))
         self.status_lbl.pack(padx=15, anchor="w", pady=5)
 
     def pre_run_check(self):
@@ -492,7 +726,6 @@ class App(tk.Tk):
         self.btn_run.config(state="disabled")
         self.all_hits.clear()
         self.is_scanning = True
-        
         rules = ResourceManager.load_audit_rules()
 
         def task():
@@ -506,8 +739,7 @@ class App(tk.Tk):
                 final_results = []
                 for i, p in enumerate(profiles):
                     if not self.is_scanning: break 
-                    
-                    self.queue.put(("msg", f"正在检索: {p['b']} -> {p['p']}"))
+                    self.queue.put(("msg", f"正在深度检索: {p['b']} -> {p['p']}"))
                     hits = ScannerCore.scan(p, rules, self.core_temp_dir)
                     final_results.extend(hits)
                     self.queue.put(("progress", int((i+1)/len(profiles)*100)))
@@ -541,21 +773,38 @@ class App(tk.Tk):
         total_count = len(unique_hits)
         
         html_content = [
-            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>浏览器痕迹 analysis 报告</title>',
-            '<style>body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:25px;background-color:#f5f7fa;}.container{max-width:1500px;margin:auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}h1{color:#2c3e50;text-align:center;border-bottom:2px solid #1890ff;padding-bottom:15px;margin-top:0;font-size:24px;}.summary{font-size:14px;color:#555;margin-bottom:20px;display:flex;justify-content:space-between;background:#e6f7ff;padding:12px 20px;border-radius:4px;border-left:4px solid #1890ff;}.highlight{color:#ff4d4f;font-weight:bold;font-size:16px;}table{width:100%;border-collapse:collapse;table-layout:fixed;box-shadow:0 1px 3px rgba(0,0,0,0.02);}th:nth-child(1),td:nth-child(1){width:10%;text-align:center;}th:nth-child(2),td:nth-child(2){width:12%;text-align:center;}th:nth-child(3),td:nth-child(3){width:10%;text-align:center;}th:nth-child(4),td:nth-child(4){width:13%;text-align:center;}th:nth-child(5),td:nth-child(5){width:55%;}th,td{padding:0 12px;height:38px;line-height:38px;border-bottom:1px solid #f0f0f0;font-size:13px;}th{background-color:#1890ff;color:white;font-weight:600;}tr:hover{background-color:#fafafa;}.url-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}a{color:#1890ff;text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}a:hover{color:#40a9ff;text-decoration:underline;}</style>',
-            '</head><body><div class="container"><h1>🔍 浏览器痕迹分析报告</h1>',
-            f'<div class="summary"><span>生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span><span>共计发现留痕记录：<span class="highlight">{total_count}</span> 条</span></div>',
-            '<table><tr><th>浏览器</th><th>配置分身</th><th>记录类型</th><th>审计分类</th><th>详细地址</th></tr>'
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>浏览器痕迹取证分析报告</title>',
+            '<style>body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:25px;background-color:#f5f7fa;}'
+            '.container{max-width:1500px;margin:auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}'
+            'h1{color:#2c3e50;text-align:center;border-bottom:2px solid #1890ff;padding-bottom:15px;margin-top:0;font-size:24px;}'
+            '.summary{font-size:14px;color:#555;margin-bottom:20px;display:flex;justify-content:space-between;'
+            'background:#e6f7ff;padding:12px 20px;border-radius:4px;border-left:4px solid #1890ff;}'
+            '.highlight{color:#ff4d4f;font-weight:bold;font-size:16px;}'
+            'table{width:100%;border-collapse:collapse;table-layout:fixed;box-shadow:0 1px 3px rgba(0,0,0,0.02);}'
+            'th:nth-child(1),td:nth-child(1){width:10%;text-align:center;}'
+            'th:nth-child(2),td:nth-child(2){width:12%;text-align:center;}'
+            'th:nth-child(3),td:nth-child(3){width:10%;text-align:center;}'
+            'th:nth-child(4),td:nth-child(4){width:13%;text-align:center;}'
+            'th:nth-child(5),td:nth-child(5){width:55%;}'
+            'th,td{padding:12px;border-bottom:1px solid #f0f0f0;font-size:13px;word-wrap:break-word;}'
+            'th{background-color:#1890ff;color:white;font-weight:600;text-align:center;}'
+            'tr:hover{background-color:#fafafa;}'
+            '.url-cell{color:#2c3e50;font-family:"Consolas",monospace;user-select:all;'
+            'background-color:#fafafa;padding:6px 10px;border-radius:4px;border:1px solid #e8e8e8;}'
+            '</style>',
+            '</head><body><div class="container"><h1>🔍 浏览器痕迹审计分析报告 (v1.1.6)</h1>',
+            f'<div class="summary"><span>生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span>'
+            f'<span>共计发现留痕记录：<span class="highlight">{total_count}</span> 条</span></div>',
+            '<table><tr><th>浏览器</th><th>配置分身</th><th>记录类型</th><th>审计分类</th><th>详细地址（双击可全选复制）</th></tr>'
         ]
         
         for h in unique_hits:
             raw_url = h[4]
             safe_url = html.escape(raw_url, quote=True)
-
             html_content.append(
                 f"<tr><td>{html.escape(h[0])}</td><td>{html.escape(h[1])}</td>"
                 f"<td>{html.escape(h[2])}</td><td><strong>{html.escape(h[3])}</strong></td>"
-                f"<td class='url-cell' title='{safe_url}'>{safe_url}</td></tr>"
+                f"<td><div class='url-cell' title='{safe_url}'>{safe_url}</div></td></tr>"
             )
             
         html_content.append("</table></div></body></html>")
@@ -563,15 +812,11 @@ class App(tk.Tk):
         try:
             with open(target_path, "w", encoding="utf-8") as f: 
                 f.write("".join(html_content))
-            
             if sys.platform == "darwin":
                 subprocess.Popen(["open", str(target_path)])
             else:
                 webbrowser.open(target_path.as_uri())
-            
-            # 🔒 完美的生命周期锁绑定：将生成的文件加入延迟销毁列表中，代替0.5秒盲等粉碎，解决多浏览器和文件重定向冲突
             self.generated_reports.append(target_path)
-            
         except Exception as e:
             logger.error(f"无痕生成调用流异常: {e}")
 
@@ -584,7 +829,6 @@ class App(tk.Tk):
 
             while not self.queue.empty():
                 msg, val = self.queue.get_nowait()
-                
                 if msg == "progress": 
                     self.pbar["value"] = val
                 elif msg == "msg": 
@@ -592,10 +836,9 @@ class App(tk.Tk):
                 elif msg == "done":
                     self.btn_run.config(state="normal")
                     self.all_hits = val
-                    
                     if self.all_hits:
                         self.execute_instant_report()
-                        self.status_lbl.config(text="完成！分析结果已无痕渲染。")
+                        self.status_lbl.config(text="完成！分析结果已无痕渲染（退出窗口将自动粉碎报告）。")
                     else:
                         self.status_lbl.config(text="扫描完成：未发现符合规则的留痕。")
                         messagebox.showinfo("检测结果", "未检测到任何匹配的交互历史。")
@@ -608,8 +851,6 @@ class App(tk.Tk):
 
     def on_exit(self):
         self.is_scanning = False 
-        
-        # 🔒 窗口退出前的绝对销毁：遍历生命周期内产生的所有临时报告，将其执行彻底的物理删除，干净程度完全一致
         if hasattr(self, 'generated_reports'):
             for report_path in self.generated_reports:
                 try:
@@ -617,7 +858,6 @@ class App(tk.Tk):
                         report_path.unlink()
                 except Exception:
                     pass
-                    
         try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
         except Exception: pass
         self.destroy()
