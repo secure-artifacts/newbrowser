@@ -1,8 +1,10 @@
 name: Build and Release with Attestation
+
 on:
   push:
     tags:
       - 'v*'
+
 jobs:
   build:
     strategy:
@@ -12,12 +14,19 @@ jobs:
           - os: windows-latest
             os_label: Windows_x64_普通电脑版
             asset_name: newbrowser-windows
-          - os: macos-latest        # M1/M2/M3 芯片 Runner
+
+          - os: windows-11-arm
+            os_label: Win_ARM64_高通骁龙本专用包
+            asset_name: newbrowser-arm64
+
+          - os: macos-latest        # M1/M2/M3 芯片 Runner (arm64)
             os_label: macOS_M芯片新款
             asset_name: newbrowser-macos
-          - os: macos-13            # 最后一个 Intel x86_64 Runner
+
+          - os: macos-15-intel      # 替代已退役的 macos-13，原生 Intel x86_64 Runner
             os_label: Mac_Intel_老款电脑专用包
             asset_name: newbrowser-intel
+
     runs-on: ${{ matrix.os }}
     permissions:
       id-token: write
@@ -35,6 +44,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pyinstaller
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+        shell: pwsh
+        if: runner.os == 'Windows'
+
+      - name: Install dependencies (non-Windows)
+        run: |
+          pip install pyinstaller
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if: runner.os != 'Windows'
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -55,13 +73,14 @@ jobs:
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Intel 包在 macos-13 Runner 上原生构建，无需 --target-arch 交叉编译
+          # 各自的 Runner 本身就是对应架构(arm64 / x86_64),原生构建,无需 --target-arch 交叉编译
           pyinstaller --onedir --windowed --name BrowserAudit browser_Gui.py --clean --noconfirm
 
           folder_name="浏览器痕迹分析-${{ github.ref_name }}-${{ matrix.os_label }}"
           stage="dist_final/${folder_name}"
           mkdir -p "$stage"
 
+          # 【纯净打包】:直接拷贝 .app 和配置文件并排,绝不修改 .app 内部文件,杜绝一切签名报错!
           cp -r dist/BrowserAudit.app "$stage/浏览器痕迹分析.app"
           cp custom-domains.conf "$stage/"
 
