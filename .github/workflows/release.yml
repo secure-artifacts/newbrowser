@@ -35,7 +35,6 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pyinstaller
-          pip install -r requirements.txt
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
