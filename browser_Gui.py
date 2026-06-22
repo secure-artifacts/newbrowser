@@ -23,7 +23,7 @@ from typing import List, Dict, Tuple, Optional, Set
 # =================================================
 # 0. 全局配置与高级日志配置
 # =================================================
-CACHE_VERSION = 11.6  # 标记 v1.1.6 专版内核
+CACHE_VERSION = 11.7  # 标记 v1.1.7 专版内核
 
 logging.basicConfig(
     level=logging.INFO,
@@ -680,7 +680,7 @@ class ScannerCore:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("浏览器痕迹分析 v1.1.6")
+        self.title("浏览器痕迹分析 v1.1.7")
         
         if sys.platform == 'win32':
             self.geometry("460x210")
@@ -792,7 +792,7 @@ class App(tk.Tk):
             '.url-cell{color:#2c3e50;font-family:"Consolas",monospace;user-select:all;'
             'background-color:#fafafa;padding:6px 10px;border-radius:4px;border:1px solid #e8e8e8;}'
             '</style>',
-            '</head><body><div class="container"><h1>🔍 浏览器痕迹审计分析报告 (v1.1.6)</h1>',
+            '</head><body><div class="container"><h1>🔍 浏览器痕迹审计分析报告 (v1.1.7)</h1>',
             f'<div class="summary"><span>生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span>'
             f'<span>共计发现留痕记录：<span class="highlight">{total_count}</span> 条</span></div>',
             '<table><tr><th>浏览器</th><th>配置分身</th><th>记录类型</th><th>审计分类</th><th>详细地址（双击可全选复制）</th></tr>'
@@ -865,7 +865,8 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-# Official Production Release Build v1.1.6-Final
-# Official Production Clean Release Build v1.1.6
-# Official Production Clean Release Build v1.1.6
+# Official Production Release Build v1.1.7-Final
+# Official Production Clean Release Build v1.1.7
+# Official Production Clean Release Build v1.1.7
 # Official Production Compliance Build v1.1.7
+# Official Production Compliance Rebuild v1.1.7
