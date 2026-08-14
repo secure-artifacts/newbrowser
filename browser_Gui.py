@@ -1,40 +1,42 @@
-import os
-import sys
-import time
-import json
 import html
+import json
+import logging
+import os
+import plistlib
+import queue
+import re
 import shutil
 import sqlite3
-import threading
-import queue
-import tempfile
-import webbrowser  
 import subprocess
-import logging
-import plistlib
-import re
-from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+
 import tkinter as tk
-from tkinter import ttk, messagebox
-from typing import List, Dict, Tuple, Optional, Set
+from tkinter import filedialog, messagebox, ttk
+
 
 # =================================================
-# 0. 全局配置与高级日志配置
+# 0. 全局配置
 # =================================================
-CACHE_VERSION = 11.7  # 标记 v1.1.7 专版内核
+APP_VERSION = "1.2.0-test1"
+MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
+MAX_RULE_COUNT = 250_000
+MAX_MATCHES = 100_000
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-gui_warning_queue = queue.Queue()
-
-# 核心内置硬编码规则库
 DEFAULT_INTERNAL_RULES = {
     "heygen.com": "AI视频(HeyGen)",
     "hailuoai.com": "AI服务(海螺AI)",
@@ -52,821 +54,1071 @@ DEFAULT_INTERNAL_RULES = {
     "klingai.com": "AI视频(快手可灵)",
     "viggle.ai": "AI视频(Viggle动画)",
     "shengxiang.baidu.com": "AI视频(百度生息)",
-    "dreamina.capcut.com": "专项审计目标"
+    "dreamina.capcut.com": "专项审计目标",
 }
 
+
 def get_base_directory() -> Path:
-    if getattr(sys, 'frozen', False):
-        if sys.platform == 'darwin':
+    """获取可执行程序旁的资源目录，并兼容 macOS App Translocation。"""
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
             exec_dir = Path(sys.executable).parent
             if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
                 app_path = exec_dir.parent.parent
                 parent_dir = app_path.parent
-                is_translocation = "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir)
-                if is_translocation:
+                if "AppTranslocation" in str(parent_dir) or "/var/folders" in str(parent_dir):
                     return Path(tempfile.gettempdir())
                 return parent_dir
-            return Path(sys.executable).parent
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
-BASE_DIR = get_base_directory()
-CACHE_FILE = BASE_DIR / "rules.cache.json"
 
+BASE_DIR = get_base_directory()
+
+
+# =================================================
+# 1. 规则资源管理
+# =================================================
 class ResourceManager:
     @staticmethod
-    def initialize():
-        pass
+    def initialize() -> None:
+        """保留初始化入口，避免未来版本破坏调用方兼容性。"""
 
     @staticmethod
     def is_browser_running() -> List[str]:
         browsers = ["chrome", "msedge", "brave", "360se", "360chrome", "firefox", "safari"]
-        running = []
+        running: List[str] = []
         try:
-            if sys.platform == 'win32':
-                tasks = os.popen('tasklist /fo csv /nh').read().lower()
-                for b in browsers:
-                    if f'"{b}.exe"' in tasks:
-                        running.append(b)
+            if sys.platform == "win32":
+                tasks = subprocess.check_output(
+                    ["tasklist", "/fo", "csv", "/nh"], text=True, errors="ignore"
+                ).lower()
+                for browser in browsers:
+                    if f'"{browser}.exe"' in tasks:
+                        running.append(browser)
             else:
-                tasks_raw = subprocess.check_output(
-                    ["ps", "-e", "-o", "comm="],
-                    text=True,
-                    errors="ignore"
+                tasks = subprocess.check_output(
+                    ["ps", "-e", "-o", "comm="], text=True, errors="ignore"
                 ).splitlines()
-                for line in tasks_raw:
-                    proc_name = Path(line.strip()).name.lower()
-                    for b in browsers:
-                        if b not in running:
-                            if proc_name == b or proc_name.startswith(f"{b}."):
-                                running.append(b)
-        except Exception as e:
-            logger.debug(f"进程检测异常: {e}")
+                for task in tasks:
+                    process_name = Path(task.strip()).name.lower()
+                    for browser in browsers:
+                        if browser not in running and (
+                            process_name == browser or process_name.startswith(f"{browser}.")
+                        ):
+                            running.append(browser)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("浏览器进程检测失败：%s", exc)
         return running
 
     @staticmethod
-    def load_audit_rules() -> Dict[str, str]:
-        rules = {}
-        possible_files = []
-        
-        if getattr(sys, 'frozen', False):
-            if sys.platform == 'darwin':
+    def _candidate_rule_files() -> List[Path]:
+        candidates: List[Path] = []
+        if getattr(sys, "frozen", False):
+            if sys.platform == "darwin":
                 exec_dir = Path(sys.executable).parent
                 if exec_dir.name == "MacOS" and exec_dir.parent.name == "Contents":
-                    possible_files.append(exec_dir.parent.parent.parent / "custom-domains.conf")
-            possible_files.append(Path(sys.executable).parent / "custom-domains.conf")
+                    candidates.append(exec_dir.parent.parent.parent / "custom-domains.conf")
+            candidates.append(Path(sys.executable).parent / "custom-domains.conf")
         else:
-            possible_files.append(Path(__file__).resolve().parent / "custom-domains.conf")
-            
+            candidates.append(Path(__file__).resolve().parent / "custom-domains.conf")
+
+        # 允许管理员通过当前用户的文档目录维护额外规则；外部文件仅作为数据读取，不执行。
         docs_dir = Path.home() / "Documents" / "浏览器痕迹分析配置"
         docs_conf = docs_dir / "custom-domains.conf"
-        possible_files.append(docs_conf)
-        
+        candidates.append(docs_conf)
         if not docs_conf.exists():
             try:
                 docs_dir.mkdir(parents=True, exist_ok=True)
                 docs_conf.write_text(
-                    "# 专项规则库 (自定义扩展区)\n"
-                    "# 💡 【macOS 用户提示】\n"
-                    "# 软件会优先尝试读取 App 同目录下的 custom-domains.conf。\n"
-                    "# 由于 macOS 的 App Translocation（应用随机转位）安全机制，在某些情况下程序实际运行路径会被系统重定向，\n"
-                    "# 导致可能无法访问放置在 .app 旁边的配置文件。\n"
-                    "# 为确保规则库始终可用，软件会自动在本目录（文稿/Documents/浏览器痕迹分析配置/）下维护一份配置文件。\n"
-                    "# 您只需修改或粘贴自定义规则至此，后续扫描时即可自动加载、增量合并并生效。\n"
-                    "# ------------------------------------------------\n"
-                    "# 格式范例：\n"
-                    "# example.com=自定义分类\n", 
-                    encoding="utf-8"
+                    "# 专项规则库（自定义扩展区）\n"
+                    "# 格式：example.com=自定义分类\n",
+                    encoding="utf-8",
                 )
-            except Exception:
-                pass
-
-        server_pattern = re.compile(r"^server=/([^/]+)/")
-        for f in possible_files:
-            if f and f.exists():
-                try:
-                    with open(f, 'r', encoding='utf-8', errors='ignore') as file_handler:
-                        for line in file_handler:
-                            line = line.strip()
-                            if not line or line.startswith("#"): continue
-                            if line.startswith("server="):
-                                match = server_pattern.match(line)
-                                if match:
-                                    domain = match.group(1).strip().lower()
-                                    if len(domain) >= 4 and "." in domain:
-                                        rules[domain] = "专项审计目标"
-                            elif "=" in line:
-                                k, v = line.split("=", 1)
-                                k = k.strip().lower()
-                                if "." in k:
-                                    rules[k] = v.strip()
-                except Exception as e:
-                    logger.error(f"解析外部规则库异常 [{f}]: {e}")
-
-        for k, v in DEFAULT_INTERNAL_RULES.items():
-            if k not in rules:
-                rules[k] = v
-                
-        return rules
-
-# =================================================
-# 2. 扫描内核 (纯流式安全穿透架构)
-# =================================================
-class ScannerCore:
-    GLOBAL_WHITE_SET = frozenset({
-        "google.com", "google.com.hk", "gstatic.com", "googleapis.com", 
-        "apple.com", "icloud.com", "microsoft.com", "bing.com", "msn.com"
-    })
-
-    # 仅跳过真正的系统级噪音目录，不屏蔽任何用户数据目录
-    # ⚠️ 注意：故意移除了 documents/downloads/videos/music/pictures，
-    #    因为 WTG 用户常将便携浏览器放在这些目录下，屏蔽会造成漏检
-    _SKIP_DIRS = frozenset({
-        "windows",
-        "program files",
-        "program files (x86)",
-        "programdata",
-        "recovery",
-        "$recycle.bin",
-        "system volume information",
-        "perflogs",
-        "intel",
-        "amd",
-        "nvidia",
-        "msocache",
-    })
+            except OSError as exc:
+                logger.debug("无法创建用户规则文件：%s", exc)
+        return candidates
 
     @staticmethod
-    def _get_current_username() -> str:
-        """安全获取当前用户名，兼容 WTG / 服务账户等边缘环境。"""
+    def load_audit_rules() -> Dict[str, str]:
+        rules: Dict[str, str] = {}
+        server_pattern = re.compile(r"^server=/([^/]+)/")
+
+        for rule_file in ResourceManager._candidate_rule_files():
+            if not rule_file.exists() or not rule_file.is_file():
+                continue
+            try:
+                if rule_file.stat().st_size > MAX_RULE_FILE_BYTES:
+                    logger.warning("规则文件过大，已忽略：%s", rule_file.name)
+                    continue
+                with rule_file.open("r", encoding="utf-8", errors="ignore") as file_handler:
+                    for line in file_handler:
+                        if len(rules) >= MAX_RULE_COUNT:
+                            logger.warning("规则数量达到上限 %d，停止读取", MAX_RULE_COUNT)
+                            break
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("server="):
+                            match = server_pattern.match(line)
+                            if match:
+                                domain = match.group(1).strip().lower()
+                                if len(domain) >= 4 and "." in domain:
+                                    rules[domain] = "专项审计目标"
+                        elif "=" in line:
+                            domain, label = line.split("=", 1)
+                            domain = domain.strip().lower()
+                            if len(domain) >= 4 and "." in domain:
+                                rules[domain] = label.strip()[:120] or "自定义分类"
+            except (OSError, UnicodeError) as exc:
+                logger.warning("解析规则文件失败 [%s]：%s", rule_file.name, exc)
+
+        for domain, label in DEFAULT_INTERNAL_RULES.items():
+            rules.setdefault(domain, label)
+        return rules
+
+
+# =================================================
+# 2. 扫描内核
+# =================================================
+class ScannerCore:
+    """浏览器资料发现和只读扫描内核。
+
+    设计原则：先使用当前进程的实际环境变量定位资料；扩展扫描仅在用户明确勾选后
+    执行。数据库读取使用 SQLite Online Backup API，绝不写入浏览器源数据库。
+    """
+
+    GLOBAL_WHITE_SET = frozenset(
+        {
+            "google.com",
+            "google.com.hk",
+            "gstatic.com",
+            "googleapis.com",
+            "apple.com",
+            "icloud.com",
+            "microsoft.com",
+            "bing.com",
+            "msn.com",
+        }
+    )
+    _SKIP_DIRS = frozenset(
+        {
+            "windows",
+            "program files",
+            "program files (x86)",
+            "programdata",
+            "recovery",
+            "$recycle.bin",
+            "system volume information",
+            "perflogs",
+            "intel",
+            "amd",
+            "nvidia",
+            "msocache",
+        }
+    )
+    _CHROMIUM_LAYOUTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+        ("Chrome", ("Google", "Chrome", "User Data")),
+        ("Chrome Beta", ("Google", "Chrome Beta", "User Data")),
+        ("Chrome Dev", ("Google", "Chrome Dev", "User Data")),
+        ("Chrome Canary", ("Google", "Chrome SxS", "User Data")),
+        ("Chrome for Testing", ("Google", "Chrome for Testing", "User Data")),
+        ("Chromium", ("Chromium", "User Data")),
+        ("Edge", ("Microsoft", "Edge", "User Data")),
+        ("Edge Beta", ("Microsoft", "Edge Beta", "User Data")),
+        ("Edge Dev", ("Microsoft", "Edge Dev", "User Data")),
+        ("Edge Canary", ("Microsoft", "Edge SxS", "User Data")),
+        ("Brave", ("BraveSoftware", "Brave-Browser", "User Data")),
+        ("360极速X", ("360chromeX", "Chrome", "User Data")),
+        (
+            "Arc",
+            (
+                "Packages",
+                "TheBrowserCompany.Arc_tchbfspa9nw8p",
+                "LocalCache",
+                "Local",
+                "Arc",
+                "User Data",
+            ),
+        ),
+    )
+    _diagnostics: List[Dict[str, str]] = []
+
+    @classmethod
+    def _reset_diagnostics(cls) -> None:
+        cls._diagnostics = []
+
+    @classmethod
+    def _record(cls, level: str, stage: str, message: str) -> None:
+        cls._diagnostics.append({"level": level, "stage": stage, "message": message})
+        log_method = logger.warning if level in {"warning", "error"} else logger.info
+        log_method("[%s] %s", stage, message)
+
+    @classmethod
+    def diagnostics_text(cls) -> str:
+        if not cls._diagnostics:
+            return "诊断信息：尚未执行扫描。"
+        lines = [f"浏览器痕迹分析诊断（{APP_VERSION}）"]
+        for event in cls._diagnostics[-80:]:
+            lines.append(f"[{event['level'].upper()}][{event['stage']}] {event['message']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalise_path_key(path: Path) -> str:
         try:
-            return os.getlogin()
-        except Exception:
-            pass
-        for env_key in ("USERNAME", "USER", "LOGNAME"):
-            val = os.environ.get(env_key, "").strip()
-            if val:
-                return val
-        return Path.home().name
+            return os.path.normcase(str(path.resolve()))
+        except OSError:
+            return os.path.normcase(str(path.absolute()))
 
     @staticmethod
     def _get_windows_drives() -> List[Path]:
-        """枚举 Windows 当前所有已挂载、可访问的盘符。"""
-        drives = []
+        """只返回固定盘和可移动盘，排除网络盘以避免企业网络扫描卡顿。"""
+        drives: List[Path] = []
         for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
             candidate = Path(f"{letter}:\\")
             try:
-                if candidate.is_dir():
-                    drives.append(candidate)
+                if not candidate.is_dir():
+                    continue
+                if sys.platform == "win32":
+                    try:
+                        import ctypes
+
+                        drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(candidate))
+                        # DRIVE_REMOVABLE=2, DRIVE_FIXED=3
+                        if drive_type not in (2, 3):
+                            continue
+                    except (AttributeError, OSError):
+                        pass
+                drives.append(candidate)
             except (OSError, PermissionError):
-                pass
+                continue
         return drives
+
+    @classmethod
+    def _chromium_candidate_dirs(cls, local_app_data: Path) -> List[Tuple[str, Path]]:
+        return [(name, local_app_data.joinpath(*parts)) for name, parts in cls._CHROMIUM_LAYOUTS]
+
+    @staticmethod
+    def _load_profile_names(user_data_path: Path) -> Dict[str, str]:
+        local_state = user_data_path / "Local State"
+        try:
+            with local_state.open("r", encoding="utf-8", errors="ignore") as file_handler:
+                data = json.load(file_handler)
+            info_cache = data.get("profile", {}).get("info_cache", {})
+            if not isinstance(info_cache, dict):
+                return {}
+            return {
+                str(profile_id): str(info.get("name", "")).strip()
+                for profile_id, info in info_cache.items()
+                if isinstance(info, dict) and str(info.get("name", "")).strip()
+            }
+        except (OSError, ValueError, TypeError):
+            return {}
 
     @staticmethod
     def _is_valid_user_data(path: Path) -> bool:
-        """
-        通过特征指纹判定是否为合法的 Chrome/Edge 系 User Data 根目录。
-        条件：目录下至少存在一个含 History 文件的子目录（即至少一个 Profile 分身）。
-        """
         if not path.is_dir():
             return False
         try:
-            for sub in path.iterdir():
-                if sub.is_dir() and (sub / "History").exists():
-                    return True
-        except (PermissionError, OSError):
-            pass
-        return False
+            return any(sub.is_dir() and (sub / "History").is_file() for sub in path.iterdir())
+        except (OSError, PermissionError):
+            return False
 
-    @staticmethod
-    def _infer_browser_name(user_data_path: Path, fallback: str = "Chrome(外置)") -> str:
-        """
-        通过路径关键字 + 内部文件特征，安全地推断外置 Chromium 系浏览器的具体名称。
-        所有 iterdir() 操作均有 try/except 保护，不会因权限问题中断上层流程。
-        """
-        path_str = str(user_data_path).lower()
-        if "edge" in path_str:
-            return "Edge(外置)"
-        if "brave" in path_str:
-            return "Brave(外置)"
-        if "chrome" in path_str:
-            return "Chrome(外置)"
-
-        # 路径名无法判断时，进一步检查内部文件特征区分 Edge vs Chrome
-        # Edge 的 User Data 根下通常有 Edge-specific 的配置文件
-        default_dir = user_data_path / "Default"
-        if (default_dir / "Edge Preferences").exists():
-            return "Edge(外置)"
-
-        # 检查根目录下的 .json/.dat 文件名是否含 edge 关键字
-        try:
-            for f in user_data_path.iterdir():
-                if f.is_file() and f.suffix in (".json", ".dat"):
-                    if "edge" in f.name.lower():
-                        return "Edge(外置)"
-        except (PermissionError, OSError):
-            pass
-
-        return fallback
-
-    @staticmethod
-    def _collect_chrome_profiles(base: Path, browser_name: str,
-                                  seen_paths: Set[str]) -> List[Dict[str, str]]:
-        """从 User Data 根目录中枚举所有有效的 Profile 分身并去重。"""
-        found = []
+    @classmethod
+    def _collect_chrome_profiles(
+        cls, base: Path, browser_name: str, seen_paths: Set[str], source: str
+    ) -> List[Dict[str, str]]:
+        found: List[Dict[str, str]] = []
+        profile_names = cls._load_profile_names(base)
         try:
             for sub in base.iterdir():
-                if not sub.is_dir():
+                if not sub.is_dir() or not (sub / "History").is_file():
                     continue
-                if not (sub / "History").exists():
+                path_key = cls._normalise_path_key(sub)
+                if path_key in seen_paths:
                     continue
-                try:
-                    real_path = str(sub.resolve())
-                except OSError:
-                    real_path = str(sub)
-                if real_path in seen_paths:
-                    continue
-                seen_paths.add(real_path)
-                found.append({
-                    "b": browser_name,
-                    "p": sub.name,
-                    "path": str(sub),
-                    "type": "C"
-                })
-        except (PermissionError, OSError) as e:
-            logger.debug(f"枚举 Profile 分身受限 [{base}]: {e}")
+                seen_paths.add(path_key)
+                readable_name = profile_names.get(sub.name, "")
+                profile_label = f"{sub.name}（{readable_name}）" if readable_name else sub.name
+                found.append(
+                    {
+                        "b": browser_name,
+                        "p": profile_label,
+                        "path": str(sub),
+                        "type": "C",
+                        "source": source,
+                    }
+                )
+        except (OSError, PermissionError) as exc:
+            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{exc}")
         return found
 
-    @staticmethod
-    def _win_scan_standard_paths(drives: List[Path], username: str,
-                                  seen_paths: Set[str]) -> List[Dict[str, str]]:
-        """策略一：全盘符标准路径高速扫描，精准命中常规安装场景。"""
-        profiles = []
-        standard_defs = [
-            (f"Users\\{username}\\AppData\\Local\\Google\\Chrome\\User Data",            "Chrome"),
-            (f"Users\\{username}\\AppData\\Local\\Microsoft\\Edge\\User Data",           "Edge"),
-            (f"Users\\{username}\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data", "Brave"),
-            (f"Users\\{username}\\AppData\\Local\\360chromeX\\Chrome\\User Data",        "360极速X"),
-            (f"Users\\{username}\\AppData\\Local\\Packages\\TheBrowserCompany.Arc_tchbfspa9nw8p\\LocalCache\\Local\\Arc\\User Data", "Arc"),
-        ]
-        for drive in drives:
-            for rel_path, bname in standard_defs:
-                base = drive / rel_path
-                if ScannerCore._is_valid_user_data(base):
-                    profiles.extend(
-                        ScannerCore._collect_chrome_profiles(base, bname, seen_paths)
-                    )
-        return profiles
-
-    @staticmethod
-    def _win_scan_firefox_standard(drives: List[Path], username: str,
-                                    seen_paths: Set[str]) -> List[Dict[str, str]]:
-        """
-        Firefox 全盘符标准 Roaming 路径扫描。
-        覆盖 WTG 场景：系统盘变更后 Roaming 路径的盘符前缀也随之变化。
-        """
-        profiles = []
-        for drive in drives:
-            ff_base = drive / f"Users\\{username}\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles"
-            if not ff_base.exists():
-                continue
-            try:
-                for sub in ff_base.iterdir():
-                    if not sub.is_dir():
-                        continue
-                    if not (sub / "places.sqlite").exists():
-                        continue
-                    try:
-                        real_path = str(sub.resolve())
-                    except OSError:
-                        real_path = str(sub)
-                    if real_path in seen_paths:
-                        continue
-                    seen_paths.add(real_path)
-                    profiles.append({
-                        "b": "Firefox", "p": sub.name,
-                        "path": str(sub), "type": "F"
-                    })
-            except (PermissionError, OSError) as e:
-                logger.debug(f"Firefox 标准路径枚举受限 [{ff_base}]: {e}")
-        return profiles
-
-    @staticmethod
-    def _win_scan_shallow_nonstandard(drives: List[Path],
-                                       seen_paths: Set[str]) -> List[Dict[str, str]]:
-        """
-        策略二：全盘符浅层非标准路径穿透扫描（深度 ≤ 3 层）。
-
-        专为以下场景设计：
-          · WTG (Windows To Go) 外置系统盘数据遗留
-          · 用户手动将 User Data / Profile 重定向至 D 盘
-          · 绿色便携版浏览器（Chrome Portable / Firefox Portable）
-          · 第三方一键搬家工具生成的非标准路径
-
-        深度 3 层可覆盖：
-          D:\\User Data\\Default\\               ← 深度1进入，深度2命中
-          D:\\Tools\\Chrome\\User Data\\Default  ← 深度1→2→3命中
-        """
-        profiles = []
-
-        def _scan_dir(current: Path, depth: int):
-            if depth > 3:
-                return
-            try:
-                entries = list(current.iterdir())
-            except (PermissionError, OSError):
-                return
-
-            for entry in entries:
-                if not entry.is_dir():
-                    continue
-                name_lower = entry.name.lower()
-                # 跳过纯系统噪音目录，用户数据目录（documents/downloads等）保留扫描
-                if name_lower in ScannerCore._SKIP_DIRS or name_lower.startswith("$"):
-                    continue
-
-                # ── Firefox 外置便携版：通过 places.sqlite 特征识别单个 Profile 目录 ──
-                if (entry / "places.sqlite").exists():
-                    try:
-                        real_path = str(entry.resolve())
-                    except OSError:
-                        real_path = str(entry)
-                    if real_path not in seen_paths:
-                        seen_paths.add(real_path)
-                        profiles.append({
-                            "b": "Firefox(外置)", "p": entry.name,
-                            "path": str(entry), "type": "F"
-                        })
-                    # 已识别为 Firefox Profile，无需继续向内递归
-                    continue
-
-                # ── Chromium 系外置：通过 History 子目录特征识别 User Data 根 ──
-                if ScannerCore._is_valid_user_data(entry):
-                    # ✅ 使用独立方法推断浏览器名，内含完整异常保护
-                    bname = ScannerCore._infer_browser_name(entry)
-                    profiles.extend(
-                        ScannerCore._collect_chrome_profiles(entry, bname, seen_paths)
-                    )
-                    # 已识别为 User Data 根，无需继续向内递归（避免重复计入子 Profile）
-                    continue
-
-                # 两种特征均未命中，继续向下递归搜索
-                _scan_dir(entry, depth + 1)
-
-        for drive in drives:
-            _scan_dir(drive, 1)
-
-        return profiles
-
-    @staticmethod
-    def _snapshot_database(db_path: Path, temp_dir: Path) -> Optional[Path]:
-        if not db_path.exists():
-            return None
-        snap_name = f"audit_db_{time.time_ns()}.db"
-        target_main_db = temp_dir / snap_name
+    @classmethod
+    def _collect_firefox_profiles(
+        cls, profiles_dir: Path, seen_paths: Set[str], source: str, browser_name: str = "Firefox"
+    ) -> List[Dict[str, str]]:
+        found: List[Dict[str, str]] = []
         try:
-            with open(db_path, "rb") as f_in:
-                with open(target_main_db, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-            return target_main_db
-        except IOError as e:
-            msg = str(e).lower()
-            if "permission" in msg or "denied" in msg:
-                if "safari" in str(db_path).lower():
-                    gui_warning_queue.put(("warning",
-                        f"【系统沙盒拦截】无法提取 Safari 数据库：\n{db_path.name}\n\n"
-                        "解决办法：请前往「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」，允许本程序。"))
-                logger.warning(f"【权限受限】{db_path.name} 拒绝访问。")
-            else:
-                logger.error(f"流式提取失败: {db_path.name} -> {e}")
-            return None
-        except Exception as e:
-            logger.error(f"提取快照异常: {db_path.name} -> {e}")
-            return None
-
-    @staticmethod
-    def get_profiles() -> List[Dict[str, str]]:
-        profiles = []
-
-        # ── Windows 全盘符主动智能穿透 ───────────────────────────────────────────
-        if sys.platform == 'win32':
-            seen_paths: Set[str] = set()
-            username = ScannerCore._get_current_username()
-            drives = ScannerCore._get_windows_drives()
-
-            logger.info(f"[Win] 智能枚举盘符: {[str(d) for d in drives]}，当前取证用户映射: {username}")
-
-            # 策略一：Chromium 系标准路径高速扫描
-            std_profiles = ScannerCore._win_scan_standard_paths(drives, username, seen_paths)
-            profiles.extend(std_profiles)
-            logger.info(f"[Win] Chromium 标准路径命中 {len(std_profiles)} 个 Profile")
-
-            # 策略一-B：Firefox 全盘符标准 Roaming 路径扫描
-            ff_std_profiles = ScannerCore._win_scan_firefox_standard(drives, username, seen_paths)
-            profiles.extend(ff_std_profiles)
-            logger.info(f"[Win] Firefox 标准路径命中 {len(ff_std_profiles)} 个 Profile")
-
-            # 策略二：浅层非标准路径穿透（WTG/D盘重定向/便携版全覆盖）
-            ext_profiles = ScannerCore._win_scan_shallow_nonstandard(drives, seen_paths)
-            profiles.extend(ext_profiles)
-            logger.info(f"[Win] 非标准路径穿透命中 {len(ext_profiles)} 个 Profile")
-
-            logger.info(f"[Win] 全盘扫描就绪：共锁定 {len(profiles)} 个独立浏览器配置分身")
-
-        # ── macOS（精美保留原逻辑，零改动）────────────────────────────────────
-        elif sys.platform == 'darwin':
-            home = Path.home()
-            safari_path = home / "Library/Safari"
-            if (safari_path / "History.db").exists() or (safari_path / "Bookmarks.plist").exists():
-                profiles.append({"b": "Safari", "p": "MainSystem", "path": str(safari_path), "type": "S"})
-            
-            mac_paths = {
-                "Chrome": home / "Library/Application Support/Google/Chrome",
-                "Edge": home / "Library/Application Support/Microsoft Edge",
-                "Brave": home / "Library/Application Support/BraveSoftware/Brave-Browser",
-                "Arc": home / "Library/Application Support/Arc/User Data"
-            }
-            for name, base in mac_paths.items():
-                if not base.exists():
+            for sub in profiles_dir.iterdir():
+                if not sub.is_dir() or not (sub / "places.sqlite").is_file():
                     continue
-                try:
-                    for sub in base.iterdir():
-                        if sub.is_dir() and (sub / "History").exists():
-                            profiles.append({"b": name, "p": sub.name, "path": str(sub), "type": "C"})
-                except Exception:
-                    pass
-            
-            ff_mac = home / "Library/Application Support/Firefox/Profiles"
-            if ff_mac.exists():
-                try:
-                    for sub in ff_mac.iterdir():
-                        if sub.is_dir() and (sub / "places.sqlite").exists():
-                            profiles.append({"b": "Firefox", "p": sub.name, "path": str(sub), "type": "F"})
-                except Exception:
-                    pass
+                path_key = cls._normalise_path_key(sub)
+                if path_key in seen_paths:
+                    continue
+                seen_paths.add(path_key)
+                found.append(
+                    {"b": browser_name, "p": sub.name, "path": str(sub), "type": "F", "source": source}
+                )
+        except (OSError, PermissionError) as exc:
+            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{exc}")
+        return found
 
-        return profiles
-
-    @staticmethod
-    def scan(profile: Dict[str, str], rule_dict: Dict[str, str], temp_dir: Path) -> List[Tuple]:
-        hits = []
-        if profile["type"] == "C":
-            profile_path = Path(profile["path"])
-            db_path = profile_path / "History"
-            tmp_db = ScannerCore._snapshot_database(db_path, temp_dir)
-            if tmp_db:
-                conn = None
-                try:
-                    conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=10)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT url FROM urls")
-                    while True:
-                        rows = cursor.fetchmany(5000)
-                        if not rows: break
-                        for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
-                    
-                    try:
-                        cursor.execute("SELECT target_path, tab_url FROM downloads")
-                        while True:
-                            d_rows = cursor.fetchmany(5000)
-                            if not d_rows: break
-                            for path, url in d_rows: ScannerCore._match(url or path, "下载文件", profile, rule_dict, hits)
-                    except sqlite3.OperationalError: 
-                        try:
-                            cursor.execute("SELECT target_path, url FROM downloads")
-                            while True:
-                                d_rows = cursor.fetchmany(5000)
-                                if not d_rows: break
-                                for path, url in d_rows: ScannerCore._match(url or path, "下载文件", profile, rule_dict, hits)
-                        except sqlite3.OperationalError: pass
-                        
-                    try:
-                        cursor.execute("SELECT url FROM downloads_url_chains")
-                        while True:
-                            c_rows = cursor.fetchmany(5000)
-                            if not c_rows: break
-                            for (url,) in c_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
-                    except sqlite3.OperationalError: pass
-                except sqlite3.DatabaseError as e: logger.debug(f"Chrome系DB异常: {e}")
-                finally:
-                    if conn: conn.close()
-                    if tmp_db:
-                        try: tmp_db.unlink(missing_ok=True)
-                        except: pass
-
-            bk_path = profile_path / "Bookmarks"
-            if bk_path.exists():
-                try:
-                    with open(bk_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        data = json.load(f)
-                        def walk_chrome(node):
-                            if "url" in node: ScannerCore._match(node["url"], "浏览器书签", profile, rule_dict, hits)
-                            if "children" in node:
-                                for child in node["children"]: walk_chrome(child)
-                        if "roots" in data:
-                            for key in ["bookmark_bar", "other", "synced"]:
-                                if key in data["roots"]: walk_chrome(data["roots"][key])
-                except Exception: pass
-
-        elif profile["type"] == "F":
-            profile_path = Path(profile["path"])
-            db_path = profile_path / "places.sqlite"
-            tmp_db = ScannerCore._snapshot_database(db_path, temp_dir)
-            if tmp_db:
-                conn = None
-                try:
-                    conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=10)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT url FROM moz_places")
-                    while True:
-                        rows = cursor.fetchmany(5000)
-                        if not rows: break
-                        for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
-                    
-                    try:
-                        cursor.execute("""
-                            SELECT DISTINCT mp.url FROM moz_annos ma
-                            JOIN moz_places mp ON ma.place_id = mp.id
-                            WHERE ma.anno_attribute_id IN (SELECT id FROM moz_anno_attributes WHERE name LIKE '%download%')
-                            UNION
-                            SELECT DISTINCT mp.url FROM moz_places mp
-                            WHERE mp.url LIKE 'file://%' OR mp.url LIKE '%content-signature%'
-                        """)
-                        while True:
-                            d_rows = cursor.fetchmany(5000)
-                            if not d_rows: break
-                            for (url,) in d_rows: ScannerCore._match(url, "下载文件", profile, rule_dict, hits)
-                    except sqlite3.OperationalError: pass
-                except sqlite3.DatabaseError as e: logger.debug(f"Firefox系DB异常: {e}")
-                finally:
-                    if conn: conn.close()
-                    if tmp_db:
-                        try: tmp_db.unlink(missing_ok=True)
-                        except: pass
-
-            dl_json_path = profile_path / "downloads.json"
-            if dl_json_path.exists():
-                try:
-                    with open(dl_json_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        dl_data = json.load(f)
-                        if isinstance(dl_data, list):
-                            for item in dl_data:
-                                if isinstance(item, dict) and "url" in item:
-                                    ScannerCore._match(item["url"], "下载文件", profile, rule_dict, hits)
-                except Exception: pass
-
-        elif profile["type"] == "S":
-            profile_path = Path(profile["path"])
-            db_path = profile_path / "History.db"
-            tmp_db = ScannerCore._snapshot_database(db_path, temp_dir)
-            if tmp_db:
-                conn = None
-                try:
-                    conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=10)
-                    cursor = conn.cursor()
-                    try: 
-                        cursor.execute("SELECT DISTINCT history_items.url FROM history_items INNER JOIN history_visits ON history_items.id = history_visits.history_item")
-                    except sqlite3.OperationalError: 
-                        try: cursor.execute("SELECT url FROM history_items")
-                        except sqlite3.OperationalError: pass
-                        
-                    while True:
-                        rows = cursor.fetchmany(5000)
-                        if not rows: break
-                        for (url,) in rows: ScannerCore._match(url, "历史记录", profile, rule_dict, hits)
-                except sqlite3.DatabaseError as e: logger.debug(f"Safari DB异常: {e}")
-                finally:
-                    if conn: conn.close()
-                    if tmp_db:
-                        try: tmp_db.unlink(missing_ok=True)
-                        except: pass
-
-            plist_path = profile_path / "Bookmarks.plist"
-            if plist_path.exists():
-                try:
-                    with open(plist_path, 'rb') as f:
-                        plist_data = plistlib.load(f)
-                        def walk_safari(node):
-                            if isinstance(node, dict):
-                                if "URLString" in node: ScannerCore._match(node["URLString"], "浏览器书签", profile, rule_dict, hits)
-                                for v in node.values(): walk_safari(v)
-                            elif isinstance(node, list):
-                                for item in node: walk_safari(item)
-                        walk_safari(plist_data)
-                except Exception as e: logger.debug(f"Safari Plist解析异常: {e}")
-                    
-        return hits
-
-    @staticmethod
-    def _match(url: str, info_type: str, profile: Dict, rule_dict: Dict, hits: List):
-        if not url: return
+    @classmethod
+    def _current_windows_local_app_data_dirs(cls) -> List[Path]:
+        candidates: List[Path] = []
+        env_local = os.environ.get("LOCALAPPDATA", "").strip()
+        if env_local:
+            candidates.append(Path(env_local))
         try:
-            domain = urlparse(url).netloc.lower() if url.startswith('http') else url.lower()
-            if ":" in domain: domain = domain.split(":")[0]
-            parts = domain.split('.')
-            for i in range(len(parts)):
-                if ".".join(parts[i:]) in ScannerCore.GLOBAL_WHITE_SET: return 
-            for i in range(len(parts)):
-                sub_domain = ".".join(parts[i:])
-                if "." in sub_domain and sub_domain in rule_dict:
-                    hits.append((profile["b"], profile["p"], info_type, rule_dict[sub_domain], url))
-                    return 
-        except Exception:
+            candidates.append(Path.home() / "AppData" / "Local")
+        except RuntimeError:
             pass
 
+        unique: List[Path] = []
+        keys: Set[str] = set()
+        for candidate in candidates:
+            key = cls._normalise_path_key(candidate)
+            if key not in keys:
+                keys.add(key)
+                unique.append(candidate)
+        return unique
+
+    @classmethod
+    def _scan_windows_current_user(cls, seen_paths: Set[str]) -> List[Dict[str, str]]:
+        profiles: List[Dict[str, str]] = []
+        local_dirs = cls._current_windows_local_app_data_dirs()
+        if not local_dirs:
+            cls._record("warning", "发现", "未获取到 LOCALAPPDATA；无法执行当前用户的标准路径扫描。")
+            return profiles
+
+        candidates_checked = 0
+        for local_app_data in local_dirs:
+            for browser_name, user_data_dir in cls._chromium_candidate_dirs(local_app_data):
+                candidates_checked += 1
+                if user_data_dir.is_dir():
+                    profiles.extend(cls._collect_chrome_profiles(user_data_dir, browser_name, seen_paths, "当前用户"))
+
+            roaming = local_app_data.parent / "Roaming" / "Mozilla" / "Firefox" / "Profiles"
+            if roaming.is_dir():
+                profiles.extend(cls._collect_firefox_profiles(roaming, seen_paths, "当前用户"))
+
+        cls._record("info", "发现", f"当前用户标准路径检查完成：检查 {candidates_checked} 个 Chromium 候选目录，发现 {len(profiles)} 个配置。")
+        return profiles
+
+    @classmethod
+    def _candidate_windows_user_roots(cls) -> List[Path]:
+        roots: List[Path] = []
+        for local_app_data in cls._current_windows_local_app_data_dirs():
+            try:
+                # C:\Users\name\AppData\Local -> C:\Users
+                roots.append(local_app_data.parents[2])
+            except IndexError:
+                continue
+        system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\/")
+        roots.append(Path(system_drive + "\\Users"))
+
+        unique: List[Path] = []
+        keys: Set[str] = set()
+        for root in roots:
+            key = cls._normalise_path_key(root)
+            if key not in keys and root.is_dir():
+                keys.add(key)
+                unique.append(root)
+        return unique
+
+    @classmethod
+    def _scan_windows_other_users(cls, seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """显式扩展模式：仅检查 Windows 用户根目录，不进行全盘递归。"""
+        profiles: List[Dict[str, str]] = []
+        ignored = {"public", "default", "default user", "all users", "desktop.ini"}
+        checked_users = 0
+        for users_root in cls._candidate_windows_user_roots():
+            try:
+                user_dirs = list(users_root.iterdir())
+            except (OSError, PermissionError) as exc:
+                cls._record("warning", "扩展发现", f"无法枚举 Windows 用户目录：{exc}")
+                continue
+            for user_dir in user_dirs:
+                if not user_dir.is_dir() or user_dir.name.lower() in ignored:
+                    continue
+                checked_users += 1
+                local_app_data = user_dir / "AppData" / "Local"
+                if not local_app_data.is_dir():
+                    continue
+                for browser_name, user_data_dir in cls._chromium_candidate_dirs(local_app_data):
+                    if user_data_dir.is_dir():
+                        profiles.extend(cls._collect_chrome_profiles(user_data_dir, browser_name, seen_paths, "授权的跨用户搜索"))
+                firefox_dir = user_dir / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles"
+                if firefox_dir.is_dir():
+                    profiles.extend(cls._collect_firefox_profiles(firefox_dir, seen_paths, "授权的跨用户搜索"))
+        cls._record("info", "扩展发现", f"授权的跨用户路径检查完成：检查 {checked_users} 个用户目录，新增 {len(profiles)} 个配置。")
+        return profiles
+
+    @staticmethod
+    def _infer_browser_name(user_data_path: Path, fallback: str = "Chromium(外置)") -> str:
+        path_text = str(user_data_path).lower()
+        if "edge" in path_text:
+            return "Edge(外置)"
+        if "brave" in path_text:
+            return "Brave(外置)"
+        if "chrome" in path_text:
+            return "Chrome(外置)"
+        if "chromium" in path_text:
+            return "Chromium(外置)"
+        return fallback
+
+    @classmethod
+    def _scan_portable_shallow(cls, seen_paths: Set[str], budget_seconds: float = 12.0) -> List[Dict[str, str]]:
+        """显式扩展模式：在本地/可移动盘进行有时间上限的浅层便携版搜索。"""
+        profiles: List[Dict[str, str]] = []
+        deadline = time.monotonic() + budget_seconds
+
+        def visit(current: Path, depth: int) -> None:
+            if depth > 3 or time.monotonic() >= deadline:
+                return
+            try:
+                with os.scandir(current) as iterator:
+                    entries = list(iterator)
+            except (OSError, PermissionError):
+                return
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    return
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                if entry.name.lower() in cls._SKIP_DIRS or entry.name.startswith("$"):
+                    continue
+                path = Path(entry.path)
+                try:
+                    if (path / "places.sqlite").is_file():
+                        path_key = cls._normalise_path_key(path)
+                        if path_key not in seen_paths:
+                            seen_paths.add(path_key)
+                            profiles.append(
+                                {"b": "Firefox(外置)", "p": path.name, "path": str(path), "type": "F", "source": "便携目录"}
+                            )
+                        continue
+                    if (path / "History").is_file():
+                        path_key = cls._normalise_path_key(path)
+                        if path_key not in seen_paths:
+                            seen_paths.add(path_key)
+                            profiles.append(
+                                {
+                                    "b": cls._infer_browser_name(path.parent),
+                                    "p": path.name,
+                                    "path": str(path),
+                                    "type": "C",
+                                    "source": "便携目录",
+                                }
+                            )
+                        continue
+                    if cls._is_valid_user_data(path):
+                        profiles.extend(
+                            cls._collect_chrome_profiles(path, cls._infer_browser_name(path), seen_paths, "便携目录")
+                        )
+                        continue
+                except (OSError, PermissionError):
+                    continue
+                visit(path, depth + 1)
+
+        drives = cls._get_windows_drives()
+        for drive in drives:
+            visit(drive, 1)
+        reason = "达到时间预算" if time.monotonic() >= deadline else "完成"
+        cls._record("info", "扩展发现", f"本地/可移动盘便携目录搜索{reason}，新增 {len(profiles)} 个配置。")
+        return profiles
+
+    @classmethod
+    def _snapshot_database(cls, db_path: Path, temp_dir: Path) -> Optional[Path]:
+        """通过 SQLite Online Backup API 建立一致的只读快照。
+
+        此方法会读取 WAL 中已提交的内容，不会修改浏览器的主库、WAL 或 SHM 文件。
+        """
+        if not db_path.is_file():
+            cls._record("warning", "数据库", f"未找到数据库文件：{db_path.name}")
+            return None
+
+        target = temp_dir / f"audit_db_{time.time_ns()}.sqlite"
+        source: Optional[sqlite3.Connection] = None
+        destination: Optional[sqlite3.Connection] = None
+        try:
+            db_uri = db_path.resolve().as_uri() + "?mode=ro"
+            source = sqlite3.connect(db_uri, uri=True, timeout=5.0)
+            source.execute("PRAGMA busy_timeout = 5000")
+            destination = sqlite3.connect(str(target), timeout=5.0)
+            source.backup(destination, pages=128, sleep=0.05)
+            destination.close()
+            destination = None
+            source.close()
+            source = None
+            return target
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            cls._record("error", "数据库", f"{db_path.name} 一致性快照失败：{type(exc).__name__}: {exc}")
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        finally:
+            if destination is not None:
+                try:
+                    destination.close()
+                except sqlite3.Error:
+                    pass
+            if source is not None:
+                try:
+                    source.close()
+                except sqlite3.Error:
+                    pass
+
+    @classmethod
+    def _collect_explicit_paths(cls, paths: List[Path], seen_paths: Set[str]) -> List[Dict[str, str]]:
+        """处理用户手工选择的资料目录；支持 Profile 目录和 User Data 根目录。"""
+        profiles: List[Dict[str, str]] = []
+        for selected_path in paths:
+            try:
+                selected = selected_path.expanduser()
+                if not selected.is_dir():
+                    cls._record("warning", "手动路径", f"所选目录不存在或不可访问：{selected}")
+                    continue
+                if (selected / "History").is_file():
+                    path_key = cls._normalise_path_key(selected)
+                    if path_key not in seen_paths:
+                        seen_paths.add(path_key)
+                        profiles.append(
+                            {
+                                "b": cls._infer_browser_name(selected.parent),
+                                "p": selected.name,
+                                "path": str(selected),
+                                "type": "C",
+                                "source": "手动选择路径",
+                            }
+                        )
+                    continue
+                if (selected / "places.sqlite").is_file():
+                    path_key = cls._normalise_path_key(selected)
+                    if path_key not in seen_paths:
+                        seen_paths.add(path_key)
+                        profiles.append(
+                            {"b": "Firefox(手动)", "p": selected.name, "path": str(selected), "type": "F", "source": "手动选择路径"}
+                        )
+                    continue
+                if cls._is_valid_user_data(selected):
+                    profiles.extend(cls._collect_chrome_profiles(selected, cls._infer_browser_name(selected), seen_paths, "手动选择路径"))
+                else:
+                    cls._record("warning", "手动路径", f"目录不是可识别的浏览器 Profile 或 User Data 根目录：{selected.name}")
+            except (OSError, PermissionError) as exc:
+                cls._record("warning", "手动路径", f"无法读取所选目录：{exc}")
+        if paths:
+            cls._record("info", "手动路径", f"手动路径检查完成：新增 {len(profiles)} 个配置。")
+        return profiles
+
+    @classmethod
+    def get_profiles(cls, include_extended: bool = False, extra_paths: Optional[List[Path]] = None) -> List[Dict[str, str]]:
+        cls._reset_diagnostics()
+        profiles: List[Dict[str, str]] = []
+        seen_paths: Set[str] = set()
+
+        if sys.platform == "win32":
+            profiles.extend(cls._scan_windows_current_user(seen_paths))
+            if include_extended:
+                profiles.extend(cls._scan_windows_other_users(seen_paths))
+                profiles.extend(cls._scan_portable_shallow(seen_paths))
+
+        elif sys.platform == "darwin":
+            home = Path.home()
+            safari_path = home / "Library" / "Safari"
+            if (safari_path / "History.db").is_file() or (safari_path / "Bookmarks.plist").is_file():
+                profiles.append({"b": "Safari", "p": "MainSystem", "path": str(safari_path), "type": "S", "source": "当前用户"})
+
+            mac_chromium = (
+                ("Chrome", home / "Library/Application Support/Google/Chrome"),
+                ("Chrome Beta", home / "Library/Application Support/Google/Chrome Beta"),
+                ("Chrome Dev", home / "Library/Application Support/Google/Chrome Dev"),
+                ("Chrome Canary", home / "Library/Application Support/Google/Chrome Canary"),
+                ("Chrome for Testing", home / "Library/Application Support/Google/Chrome for Testing"),
+                ("Chromium", home / "Library/Application Support/Chromium"),
+                ("Edge", home / "Library/Application Support/Microsoft Edge"),
+                ("Brave", home / "Library/Application Support/BraveSoftware/Brave-Browser"),
+                ("Arc", home / "Library/Application Support/Arc/User Data"),
+            )
+            for browser_name, user_data_dir in mac_chromium:
+                if user_data_dir.is_dir():
+                    profiles.extend(cls._collect_chrome_profiles(user_data_dir, browser_name, seen_paths, "当前用户"))
+            firefox_dir = home / "Library/Application Support/Firefox/Profiles"
+            if firefox_dir.is_dir():
+                profiles.extend(cls._collect_firefox_profiles(firefox_dir, seen_paths, "当前用户"))
+            cls._record("info", "发现", f"macOS 当前用户路径检查完成：发现 {len(profiles)} 个配置。")
+        else:
+            cls._record("warning", "发现", f"当前系统不受支持：{sys.platform}")
+
+        if extra_paths:
+            profiles.extend(cls._collect_explicit_paths(extra_paths, seen_paths))
+
+        profiles.sort(key=lambda item: (item["b"].lower(), item["p"].lower(), item["path"].lower()))
+        cls._record("info", "发现", f"浏览器配置发现完成：共识别 {len(profiles)} 个独立配置。")
+        return profiles
+
+    @classmethod
+    def _read_urls(cls, cursor: sqlite3.Cursor, query: str, profile: Dict[str, str], info_type: str, rules: Dict[str, str], hits: List[Tuple]) -> None:
+        cursor.execute(query)
+        while True:
+            rows = cursor.fetchmany(5000)
+            if not rows:
+                break
+            for row in rows:
+                for value in row:
+                    if value:
+                        cls._match(str(value), info_type, profile, rules, hits)
+
+    @staticmethod
+    def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> Set[str]:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return {str(row[1]) for row in cursor.fetchall()}
+
+    @classmethod
+    def _scan_chromium_downloads(cls, cursor: sqlite3.Cursor, profile: Dict[str, str], rules: Dict[str, str], hits: List[Tuple]) -> None:
+        try:
+            columns = cls._table_columns(cursor, "downloads")
+            if columns:
+                preferred = [column for column in ("tab_url", "url", "site_url", "referrer", "target_path", "current_path") if column in columns]
+                if preferred:
+                    cls._read_urls(
+                        cursor,
+                        "SELECT " + ", ".join(preferred) + " FROM downloads",
+                        profile,
+                        "下载文件",
+                        rules,
+                        hits,
+                    )
+        except sqlite3.Error as exc:
+            cls._record("info", "下载记录", f"{profile['b']} / {profile['p']} 的 downloads 表不可用：{exc}")
+
+        try:
+            cls._read_urls(cursor, "SELECT url FROM downloads_url_chains", profile, "下载文件", rules, hits)
+        except sqlite3.Error:
+            # 旧版 Chromium 可能没有 downloads_url_chains，此处属于可预期兼容分支。
+            pass
+
+    @classmethod
+    def _scan_chromium(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+        profile_path = Path(profile["path"])
+        snapshot = cls._snapshot_database(profile_path / "History", temp_dir)
+        if snapshot is None:
+            return
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+            cursor = connection.cursor()
+            cls._read_urls(cursor, "SELECT url FROM urls WHERE url IS NOT NULL", profile, "历史记录", rules, hits)
+            cls._scan_chromium_downloads(cursor, profile, rules, hits)
+        except sqlite3.Error as exc:
+            cls._record("error", "数据库", f"{profile['b']} / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError as exc:
+                cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+
+        bookmark_path = profile_path / "Bookmarks"
+        if bookmark_path.is_file():
+            try:
+                with bookmark_path.open("r", encoding="utf-8", errors="ignore") as file_handler:
+                    data = json.load(file_handler)
+
+                def walk(node: object) -> None:
+                    if not isinstance(node, dict):
+                        return
+                    value = node.get("url")
+                    if isinstance(value, str):
+                        cls._match(value, "浏览器书签", profile, rules, hits)
+                    children = node.get("children", [])
+                    if isinstance(children, list):
+                        for child in children:
+                            walk(child)
+
+                roots = data.get("roots", {}) if isinstance(data, dict) else {}
+                if isinstance(roots, dict):
+                    for root in roots.values():
+                        walk(root)
+            except (OSError, ValueError, TypeError) as exc:
+                cls._record("warning", "书签", f"{profile['b']} / {profile['p']} 书签解析失败：{exc}")
+
+    @classmethod
+    def _scan_firefox(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+        profile_path = Path(profile["path"])
+        snapshot = cls._snapshot_database(profile_path / "places.sqlite", temp_dir)
+        if snapshot is None:
+            return
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+            cursor = connection.cursor()
+            cls._read_urls(cursor, "SELECT url FROM moz_places WHERE url IS NOT NULL", profile, "历史记录", rules, hits)
+            try:
+                cls._read_urls(
+                    cursor,
+                    """
+                    SELECT DISTINCT mp.url FROM moz_annos ma
+                    JOIN moz_places mp ON ma.place_id = mp.id
+                    WHERE ma.anno_attribute_id IN (
+                        SELECT id FROM moz_anno_attributes WHERE name LIKE '%download%'
+                    )
+                    UNION
+                    SELECT DISTINCT url FROM moz_places
+                    WHERE url LIKE 'file://%' OR url LIKE '%content-signature%'
+                    """,
+                    profile,
+                    "下载文件",
+                    rules,
+                    hits,
+                )
+            except sqlite3.Error:
+                pass
+        except sqlite3.Error as exc:
+            cls._record("error", "数据库", f"Firefox / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError as exc:
+                cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+
+    @classmethod
+    def _scan_safari(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+        profile_path = Path(profile["path"])
+        snapshot = cls._snapshot_database(profile_path / "History.db", temp_dir)
+        if snapshot is not None:
+            connection: Optional[sqlite3.Connection] = None
+            try:
+                connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+                cursor = connection.cursor()
+                try:
+                    query = """
+                        SELECT DISTINCT history_items.url FROM history_items
+                        INNER JOIN history_visits ON history_items.id = history_visits.history_item
+                    """
+                    cls._read_urls(cursor, query, profile, "历史记录", rules, hits)
+                except sqlite3.Error:
+                    cls._read_urls(cursor, "SELECT url FROM history_items", profile, "历史记录", rules, hits)
+            except sqlite3.Error as exc:
+                cls._record("error", "数据库", f"Safari 读取失败：{type(exc).__name__}: {exc}")
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                try:
+                    snapshot.unlink(missing_ok=True)
+                except OSError as exc:
+                    cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+
+        plist_path = profile_path / "Bookmarks.plist"
+        if plist_path.is_file():
+            try:
+                with plist_path.open("rb") as file_handler:
+                    plist_data = plistlib.load(file_handler)
+
+                def walk(node: object) -> None:
+                    if isinstance(node, dict):
+                        value = node.get("URLString")
+                        if isinstance(value, str):
+                            cls._match(value, "浏览器书签", profile, rules, hits)
+                        for value in node.values():
+                            walk(value)
+                    elif isinstance(node, list):
+                        for child in node:
+                            walk(child)
+
+                walk(plist_data)
+            except (OSError, ValueError, TypeError) as exc:
+                cls._record("warning", "书签", f"Safari 书签解析失败：{exc}")
+
+    @classmethod
+    def scan(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path) -> List[Tuple]:
+        hits: List[Tuple] = []
+        if profile["type"] == "C":
+            cls._scan_chromium(profile, rules, temp_dir, hits)
+        elif profile["type"] == "F":
+            cls._scan_firefox(profile, rules, temp_dir, hits)
+        elif profile["type"] == "S":
+            cls._scan_safari(profile, rules, temp_dir, hits)
+        return hits
+
+    @classmethod
+    def _match(cls, url: str, info_type: str, profile: Dict[str, str], rules: Dict[str, str], hits: List[Tuple]) -> None:
+        if not url or len(hits) >= MAX_MATCHES or len(url) > 8192:
+            return
+        try:
+            parsed = urlparse(url)
+            domain = (parsed.hostname or "").lower()
+            if not domain:
+                return
+            labels = domain.split(".")
+            for index in range(len(labels)):
+                if ".".join(labels[index:]) in cls.GLOBAL_WHITE_SET:
+                    return
+            for index in range(len(labels)):
+                candidate = ".".join(labels[index:])
+                if "." in candidate and candidate in rules:
+                    hits.append((profile["b"], profile["p"], info_type, rules[candidate], url))
+                    return
+        except (ValueError, TypeError):
+            return
+
+
 # =================================================
-# 3. GUI 控制台 (无痕高稳定性重隔绝正式发布版)
+# 3. GUI
 # =================================================
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.title("浏览器痕迹分析 v1.1.7")
-        
-        if sys.platform == 'win32':
-            self.geometry("460x210")
-        else:
-            self.geometry("460x170")
-            
+        self.title(f"浏览器痕迹分析 v{APP_VERSION}")
+        self.geometry("540x305" if sys.platform == "win32" else "540x285")
         self.resizable(False, False)
-        
-        self.all_hits = []
-        self.is_scanning = False 
-        self.generated_reports = []  # 🔒 统一生命周期锁：用于最终强力物理蒸发
-        
+
+        self.all_hits: List[Tuple] = []
+        self.is_scanning = False
+        self.generated_reports: List[Path] = []
+        self.queue: queue.Queue = queue.Queue()
+        self.core_temp_dir = Path(tempfile.mkdtemp(prefix="browser_audit_"))
+        self.report_dir = self.core_temp_dir / "reports"
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.extended_scan_var = tk.BooleanVar(value=False)
+        self.selected_paths: List[Path] = []
+        self.last_profile_count = 0
+
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
-        self.queue = queue.Queue()
-        self.core_temp_dir = Path(tempfile.mkdtemp(prefix="audit_core_"))
-        
         self._build_ui()
         self.after(100, self._process_queue)
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         header = tk.Frame(self, pady=10)
         header.pack(fill=tk.X, padx=15)
-        title_box = tk.Frame(header)
-        title_box.pack(side=tk.LEFT)
-        tk.Label(title_box, text="TRACE AUDITOR PRO", font=("Arial", 8, "bold"), fg="#ff4d4f").pack(anchor="w")
-        tk.Label(title_box, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
+        tk.Label(header, text="TRACE AUDITOR PRO", font=("Arial", 8, "bold"), fg="#d9363e").pack(anchor="w")
+        tk.Label(header, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
+        tk.Label(
+            header,
+            text="v1.2 测试版：Chrome 多通道识别、WAL 一致性读取与可复制诊断",
+            font=("Arial", 9),
+            fg="#555",
+        ).pack(anchor="w", pady=(2, 0))
 
-        btn_box = tk.Frame(self)
-        btn_box.pack(fill=tk.X, padx=15, pady=5)
-        self.btn_run = tk.Button(btn_box, text="🚀 开始检测", command=self.pre_run_check, font=("Arial", 10, "bold"), height=2)
+        control_box = tk.Frame(self)
+        control_box.pack(fill=tk.X, padx=15, pady=(2, 4))
+        self.btn_run = tk.Button(control_box, text="开始检测", command=self.run, font=("Arial", 10, "bold"), height=2)
         self.btn_run.pack(fill=tk.X, expand=True)
 
-        self.pbar = ttk.Progressbar(self, mode='determinate')
-        self.pbar.pack(fill=tk.X, padx=15, pady=(10, 0))
-        self.status_lbl = tk.Label(self, text="系统就绪，全盘智能审计通道已就绪...", fg="#666", font=("Arial", 9))
-        self.status_lbl.pack(padx=15, anchor="w", pady=5)
+        tk.Checkbutton(
+            self,
+            text="扩展兼容搜索（经授权后检查同机其他用户目录与本地/可移动盘便携版）",
+            variable=self.extended_scan_var,
+            anchor="w",
+            justify=tk.LEFT,
+            font=("Arial", 9),
+        ).pack(fill=tk.X, padx=15, pady=(2, 0))
 
-    def pre_run_check(self):
-        self.run()
+        action_box = tk.Frame(self)
+        action_box.pack(fill=tk.X, padx=15, pady=(2, 0))
+        tk.Button(action_box, text="选择浏览器数据目录", command=self.choose_browser_directory, font=("Arial", 9)).pack(side=tk.LEFT)
+        self.btn_copy_diagnostic = tk.Button(action_box, text="复制诊断信息", command=self.copy_diagnostics, font=("Arial", 9))
+        self.btn_copy_diagnostic.pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(
+            action_box,
+            text="诊断不包含 URL、Cookie、账号或浏览器数据库内容。",
+            fg="#666",
+            font=("Arial", 8),
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
-    def run(self):
+        self.pbar = ttk.Progressbar(self, mode="determinate")
+        self.pbar.pack(fill=tk.X, padx=15, pady=(9, 0))
+        self.status_lbl = tk.Label(self, text="系统就绪：默认仅检查当前用户的标准浏览器路径。", fg="#555", font=("Arial", 9), anchor="w", justify=tk.LEFT, wraplength=510)
+        self.status_lbl.pack(fill=tk.X, padx=15, pady=(5, 0))
+
+    def choose_browser_directory(self) -> None:
+        initial_dir = os.environ.get("LOCALAPPDATA", str(Path.home()))
+        directory = filedialog.askdirectory(title="选择 Chrome Profile 或 User Data 文件夹", initialdir=initial_dir, mustexist=True)
+        if not directory:
+            return
+        selected = Path(directory)
+        selected_key = ScannerCore._normalise_path_key(selected)
+        if all(ScannerCore._normalise_path_key(path) != selected_key for path in self.selected_paths):
+            self.selected_paths.append(selected)
+        self.status_lbl.config(text=f"已添加手动路径：{selected.name}。开始检测时将一并检查；已添加 {len(self.selected_paths)} 个路径。")
+
+    def copy_diagnostics(self) -> None:
+        diagnostic = ScannerCore.diagnostics_text()
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(diagnostic)
+            self.update()
+            self.status_lbl.config(text="诊断信息已复制。请直接粘贴反馈；其中不含历史网址或账号数据。")
+        except tk.TclError as exc:
+            messagebox.showerror("复制失败", f"无法写入剪贴板：{exc}")
+
+    def run(self) -> None:
         self.btn_run.config(state="disabled")
+        self.pbar["value"] = 0
         self.all_hits.clear()
         self.is_scanning = True
+        self.last_profile_count = 0
+        include_extended = self.extended_scan_var.get()
+        extra_paths = list(self.selected_paths)
         rules = ResourceManager.load_audit_rules()
 
-        def task():
+        def task() -> None:
             try:
-                profiles = ScannerCore.get_profiles()
+                profiles = ScannerCore.get_profiles(include_extended=include_extended, extra_paths=extra_paths)
+                self.queue.put(("discovery", len(profiles)))
                 if not profiles:
-                    self.queue.put(("msg", "分析结束：未定位到有效的浏览器历史配置文件。"))
                     self.queue.put(("done", []))
                     return
 
-                final_results = []
-                for i, p in enumerate(profiles):
-                    if not self.is_scanning: break 
-                    self.queue.put(("msg", f"正在深度检索: {p['b']} -> {p['p']}"))
-                    hits = ScannerCore.scan(p, rules, self.core_temp_dir)
-                    final_results.extend(hits)
-                    self.queue.put(("progress", int((i+1)/len(profiles)*100)))
-                    
+                final_results: List[Tuple] = []
+                for index, profile in enumerate(profiles):
+                    if not self.is_scanning:
+                        break
+                    self.queue.put(("msg", f"正在读取：{profile['b']} → {profile['p']}"))
+                    final_results.extend(ScannerCore.scan(profile, rules, self.core_temp_dir))
+                    self.queue.put(("progress", int((index + 1) / len(profiles) * 100)))
+
                 if self.is_scanning:
                     self.queue.put(("done", final_results))
-            except Exception as e:
-                logger.error("扫描核心异常", exc_info=True)
-                self.queue.put(("msg", f"异常中断: {str(e)}"))
-                self.queue.put(("error", None))
+            except Exception as exc:  # 保留最上层保护，完整异常会进入日志与诊断。
+                logger.exception("扫描核心异常")
+                ScannerCore._record("error", "扫描", f"扫描中断：{type(exc).__name__}: {exc}")
+                self.queue.put(("error", str(exc)))
             finally:
                 self.is_scanning = False
 
-        threading.Thread(target=task, daemon=True).start()
+        threading.Thread(target=task, daemon=True, name="browser-audit-scan").start()
 
-    def execute_instant_report(self):
-        if not self.all_hits: return
-
-        report_dir = Path(tempfile.gettempdir())
-        file_name = f"Browser_Audit_Report_{time.time_ns()}.html"
-        target_path = report_dir / file_name
-        
-        unique_hits = []
-        seen = set()
-        for h in self.all_hits:
-            key = (h[0], h[1], h[2], h[4]) 
+    def execute_instant_report(self) -> None:
+        if not self.all_hits:
+            return
+        target_path = self.report_dir / f"Browser_Audit_Report_{time.time_ns()}.html"
+        unique_hits: List[Tuple] = []
+        seen: Set[Tuple[str, str, str, str]] = set()
+        for hit in self.all_hits:
+            key = (hit[0], hit[1], hit[2], hit[4])
             if key not in seen:
                 seen.add(key)
-                unique_hits.append(h)
-                
-        total_count = len(unique_hits)
-        
+                unique_hits.append(hit)
+
         html_content = [
-            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>浏览器痕迹取证分析报告</title>',
-            '<style>body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:25px;background-color:#f5f7fa;}'
-            '.container{max-width:1500px;margin:auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.06);}'
-            'h1{color:#2c3e50;text-align:center;border-bottom:2px solid #1890ff;padding-bottom:15px;margin-top:0;font-size:24px;}'
-            '.summary{font-size:14px;color:#555;margin-bottom:20px;display:flex;justify-content:space-between;'
-            'background:#e6f7ff;padding:12px 20px;border-radius:4px;border-left:4px solid #1890ff;}'
-            '.highlight{color:#ff4d4f;font-weight:bold;font-size:16px;}'
-            'table{width:100%;border-collapse:collapse;table-layout:fixed;box-shadow:0 1px 3px rgba(0,0,0,0.02);}'
-            'th:nth-child(1),td:nth-child(1){width:10%;text-align:center;}'
-            'th:nth-child(2),td:nth-child(2){width:12%;text-align:center;}'
-            'th:nth-child(3),td:nth-child(3){width:10%;text-align:center;}'
-            'th:nth-child(4),td:nth-child(4){width:13%;text-align:center;}'
-            'th:nth-child(5),td:nth-child(5){width:55%;}'
-            'th,td{padding:12px;border-bottom:1px solid #f0f0f0;font-size:13px;word-wrap:break-word;}'
-            'th{background-color:#1890ff;color:white;font-weight:600;text-align:center;}'
-            'tr:hover{background-color:#fafafa;}'
-            '.url-cell{color:#2c3e50;font-family:"Consolas",monospace;user-select:all;'
-            'background-color:#fafafa;padding:6px 10px;border-radius:4px;border:1px solid #e8e8e8;}'
-            '</style>',
-            '</head><body><div class="container"><h1>🔍 浏览器痕迹审计分析报告 (v1.1.7)</h1>',
-            f'<div class="summary"><span>生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span>'
-            f'<span>共计发现留痕记录：<span class="highlight">{total_count}</span> 条</span></div>',
-            '<table><tr><th>浏览器</th><th>配置分身</th><th>记录类型</th><th>审计分类</th><th>详细地址（双击可全选复制）</th></tr>'
+            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>浏览器痕迹分析报告</title>",
+            "<style>body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:25px;background:#f5f7fa;}"
+            ".container{max-width:1500px;margin:auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.06);}"
+            "h1{color:#2c3e50;text-align:center;border-bottom:2px solid #1890ff;padding-bottom:15px;margin-top:0;font-size:24px;}"
+            ".summary{font-size:14px;color:#555;margin-bottom:20px;display:flex;justify-content:space-between;background:#e6f7ff;padding:12px 20px;border-radius:4px;border-left:4px solid #1890ff;}"
+            ".highlight{color:#d9363e;font-weight:bold;font-size:16px;}table{width:100%;border-collapse:collapse;table-layout:fixed;}"
+            "th:nth-child(1),td:nth-child(1){width:10%;text-align:center;}th:nth-child(2),td:nth-child(2){width:12%;text-align:center;}"
+            "th:nth-child(3),td:nth-child(3){width:10%;text-align:center;}th:nth-child(4),td:nth-child(4){width:13%;text-align:center;}th:nth-child(5),td:nth-child(5){width:55%;}"
+            "th,td{padding:12px;border-bottom:1px solid #f0f0f0;font-size:13px;word-wrap:break-word;}th{background:#1890ff;color:white;font-weight:600;text-align:center;}"
+            ".url-cell{color:#2c3e50;font-family:Consolas,monospace;user-select:all;background:#fafafa;padding:6px 10px;border-radius:4px;border:1px solid #e8e8e8;}"
+            "</style></head><body><div class='container'>",
+            f"<h1>浏览器痕迹分析报告（v{APP_VERSION}）</h1>",
+            f"<div class='summary'><span>生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>"
+            f"<span>匹配记录：<span class='highlight'>{len(unique_hits)}</span> 条</span></div>",
+            "<table><tr><th>浏览器</th><th>配置分身</th><th>记录类型</th><th>审计分类</th><th>详细地址（可复制）</th></tr>",
         ]
-        
-        for h in unique_hits:
-            raw_url = h[4]
-            safe_url = html.escape(raw_url, quote=True)
+        for hit in unique_hits:
+            safe_values = [html.escape(str(value), quote=True) for value in hit]
             html_content.append(
-                f"<tr><td>{html.escape(h[0])}</td><td>{html.escape(h[1])}</td>"
-                f"<td>{html.escape(h[2])}</td><td><strong>{html.escape(h[3])}</strong></td>"
-                f"<td><div class='url-cell' title='{safe_url}'>{safe_url}</div></td></tr>"
+                f"<tr><td>{safe_values[0]}</td><td>{safe_values[1]}</td><td>{safe_values[2]}</td>"
+                f"<td><strong>{safe_values[3]}</strong></td><td><div class='url-cell' title='{safe_values[4]}'>{safe_values[4]}</div></td></tr>"
             )
-            
         html_content.append("</table></div></body></html>")
-        
+
         try:
-            with open(target_path, "w", encoding="utf-8") as f: 
-                f.write("".join(html_content))
+            target_path.write_text("".join(html_content), encoding="utf-8")
+            self.generated_reports.append(target_path)
             if sys.platform == "darwin":
                 subprocess.Popen(["open", str(target_path)])
             else:
                 webbrowser.open(target_path.as_uri())
-            self.generated_reports.append(target_path)
-        except Exception as e:
-            logger.error(f"无痕生成调用流异常: {e}")
+        except OSError as exc:
+            ScannerCore._record("error", "报告", f"报告生成失败：{exc}")
+            messagebox.showerror("报告生成失败", str(exc))
 
-    def _process_queue(self):
+    def _process_queue(self) -> None:
         try:
-            while not gui_warning_queue.empty():
-                w_type, w_msg = gui_warning_queue.get_nowait()
-                if w_type == "warning":
-                    messagebox.showwarning("系统权限受限提示", w_msg)
-
-            while not self.queue.empty():
-                msg, val = self.queue.get_nowait()
-                if msg == "progress": 
-                    self.pbar["value"] = val
-                elif msg == "msg": 
-                    self.status_lbl.config(text=val)
-                elif msg == "done":
-                    self.btn_run.config(state="normal")
-                    self.all_hits = val
-                    if self.all_hits:
-                        self.execute_instant_report()
-                        self.status_lbl.config(text="完成！分析结果已无痕渲染（退出窗口将自动粉碎报告）。")
-                    else:
-                        self.status_lbl.config(text="扫描完成：未发现符合规则的留痕。")
-                        messagebox.showinfo("检测结果", "未检测到任何匹配的交互历史。")
-                elif msg == "error":
-                    self.btn_run.config(state="normal")
-        finally:
-            try: self.update_idletasks()
-            except Exception: pass
-            self.after(100, self._process_queue)
-
-    def on_exit(self):
-        self.is_scanning = False 
-        if hasattr(self, 'generated_reports'):
-            for report_path in self.generated_reports:
+            while True:
                 try:
-                    if report_path.exists():
-                        report_path.unlink()
-                except Exception:
-                    pass
-        try: shutil.rmtree(self.core_temp_dir, ignore_errors=True)
-        except Exception: pass
+                    message_type, value = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                if message_type == "progress":
+                    self.pbar["value"] = value
+                elif message_type == "msg":
+                    self.status_lbl.config(text=value)
+                elif message_type == "discovery":
+                    self.last_profile_count = int(value)
+                    self.status_lbl.config(text=f"已识别 {self.last_profile_count} 个浏览器配置，正在读取数据库。")
+                elif message_type == "done":
+                    self.btn_run.config(state="normal")
+                    self.all_hits = value
+                    if self.last_profile_count == 0:
+                        self.status_lbl.config(text="未识别浏览器配置。请复制诊断信息；必要时在已获授权后勾选“扩展兼容搜索”再试。")
+                        messagebox.showwarning(
+                            "未识别浏览器配置",
+                            "未识别到可读取的浏览器配置。\n\n"
+                            "请点击“复制诊断信息”并反馈文本；文本不含网址、Cookie 或账号数据。\n"
+                            "若设备由远程工具/管理员账户运行，请在获得授权后勾选扩展兼容搜索后重试。",
+                        )
+                    elif self.all_hits:
+                        self.execute_instant_report()
+                        self.status_lbl.config(text=f"完成：识别 {self.last_profile_count} 个配置，命中 {len(self.all_hits)} 条记录，报告已在浏览器打开。")
+                    else:
+                        self.status_lbl.config(text=f"扫描完成：已读取 {self.last_profile_count} 个配置，未发现符合当前规则的留痕。")
+                        messagebox.showinfo("检测结果", "已读取浏览器配置，但没有匹配到当前规则库中的记录。")
+                elif message_type == "error":
+                    self.btn_run.config(state="normal")
+                    self.status_lbl.config(text=f"扫描异常中断：{value}。请复制诊断信息反馈。")
+                    messagebox.showerror("扫描异常", f"扫描异常中断：{value}\n\n请复制诊断信息反馈。")
+        finally:
+            try:
+                self.after(100, self._process_queue)
+            except tk.TclError:
+                pass
+
+    def on_exit(self) -> None:
+        self.is_scanning = False
+        for report_path in self.generated_reports:
+            try:
+                report_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("报告仍被占用，未能删除：%s", exc)
+        try:
+            shutil.rmtree(self.core_temp_dir, ignore_errors=False)
+        except OSError as exc:
+            logger.warning("临时目录仍被占用，未能删除：%s", exc)
         self.destroy()
 
+
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
-# Official Production Release Build v1.1.7-Final
-# Official Production Clean Release Build v1.1.7
-# Official Production Clean Release Build v1.1.7
-# Official Production Compliance Build v1.1.7
-# Official Production Compliance Rebuild v1.1.7
+    App().mainloop()
