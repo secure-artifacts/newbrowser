@@ -1,0 +1,56 @@
+name: Build Windows Test Package
+
+on:
+  push:
+    branches:
+      - fix/windows-chrome-compat-v1.2.0-test
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-test:
+    name: Windows x64 Test Package
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependency
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller==6.10.0"
+
+      - name: Run core regression tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
+          $packageName = "浏览器痕迹分析-v1.2.0-test1-Windows-x64"
+          $stage = "package/$packageName"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
+          Copy-Item "custom-domains.conf" "$stage/custom-domains.conf" -Force
+          Copy-Item "WINDOWS_TEST_GUIDE.md" "$stage/测试说明.md" -Force
+          Compress-Archive -Path $stage -DestinationPath "package/$packageName.zip" -Force
+
+      - name: Upload Windows test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 浏览器痕迹分析-v1.2.0-test1-Windows-x64
+          path: package/*.zip
+          if-no-files-found: error
+          retention-days: 14

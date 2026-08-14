@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -105,6 +106,29 @@ class ScannerCoreTests(unittest.TestCase):
             "https://site.example.test/c",
             "https://chain.example.test/d",
         }.issubset(urls))
+
+    def test_windows_discovery_uses_localappdata_not_login_name(self):
+        local_app_data = self.root / "redirected" / "Local"
+        profile = local_app_data / "Google" / "Chrome Dev" / "User Data" / "Default"
+        profile.mkdir(parents=True)
+        (profile / "History").write_bytes(b"SQLite format 3\\x00")
+
+        old_platform = MODULE.sys.platform
+        old_local_app_data = os.environ.get("LOCALAPPDATA")
+        try:
+            MODULE.sys.platform = "win32"
+            os.environ["LOCALAPPDATA"] = str(local_app_data)
+            profiles = ScannerCore.get_profiles()
+        finally:
+            MODULE.sys.platform = old_platform
+            if old_local_app_data is None:
+                os.environ.pop("LOCALAPPDATA", None)
+            else:
+                os.environ["LOCALAPPDATA"] = old_local_app_data
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["b"], "Chrome Dev")
+        self.assertEqual(profiles[0]["p"], "Default")
 
     def test_manual_profile_path_is_recognised(self):
         profile = self.root / "Custom Profile"
