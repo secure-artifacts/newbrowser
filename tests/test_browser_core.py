@@ -9,16 +9,25 @@ import unittest
 from pathlib import Path
 
 
-# 测试环境可能没有安装 Tk；扫描内核在导入阶段不依赖图形能力，因此提供最小桩。
-try:
-    import tkinter  # noqa: F401
-except ModuleNotFoundError:
+# 扫描内核测试不依赖图形能力。云构建可强制使用最小 Tk 桩，避免宿主 Python 的
+# Tcl/Tk 安装差异干扰数据库与路径发现回归测试。
+def install_tk_stub() -> None:
     tkinter_stub = types.ModuleType("tkinter")
     tkinter_stub.Tk = object
     tkinter_stub.filedialog = types.SimpleNamespace()
     tkinter_stub.messagebox = types.SimpleNamespace()
     tkinter_stub.ttk = types.SimpleNamespace()
     sys.modules["tkinter"] = tkinter_stub
+
+
+if os.environ.get("BROWSER_AUDIT_HEADLESS_TESTS") == "1":
+    sys.modules.pop("tkinter", None)
+    install_tk_stub()
+else:
+    try:
+        import tkinter  # noqa: F401
+    except ModuleNotFoundError:
+        install_tk_stub()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_FILE = PROJECT_ROOT / "browser_Gui.py"
