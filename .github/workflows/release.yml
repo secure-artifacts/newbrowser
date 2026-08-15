@@ -153,8 +153,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # 诊断日志仅用于失败排障，绝不作为正式 Release 资产；兼容清理此前失败构建遗留文件。
+      - name: Remove stale diagnostic asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset "${{ github.ref_name }}" windows-regression-tests.log --yes || true
+
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: artifacts/*
+          files: artifacts/newbrowser-*.zip
           generate_release_notes: true
