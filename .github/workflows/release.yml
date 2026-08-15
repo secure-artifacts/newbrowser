@@ -153,17 +153,15 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      # 诊断日志仅用于失败排障，绝不作为正式 Release 资产。按 ID 删除历史遗留文件；
-      # 若 API 调用失败则中止发布，避免让未证明资产继续停留在正式页面。
-      - name: Remove stale diagnostic asset
+      # 诊断日志仅用于失败排障，绝不作为正式 Release 资产。若重建同一版本，
+      # 先删除旧 Release 的整份资产清单，再由下方步骤只上传新构建且已证明的 ZIP。
+      - name: Recreate Release without stale assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.id')"
-          stale_asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate --jq '.[] | select(.name == "windows-regression-tests.log") | .id')"
-          for asset_id in ${stale_asset_ids}; do
-            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-          done
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release delete "${GITHUB_REF_NAME}" --yes
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
