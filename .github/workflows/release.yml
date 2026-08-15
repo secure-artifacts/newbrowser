@@ -72,9 +72,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           $env:BROWSER_AUDIT_HEADLESS_TESTS = "1"
-          python -m unittest discover -s tests -v
+          python -m unittest discover -s tests -v *>&1 | Tee-Object -FilePath windows-regression-tests.log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            Write-Error "Windows core regression tests failed with exit code $testExitCode."
+            exit $testExitCode
+          }
+
+      - name: Upload Windows regression test log
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-regression-test-log-${{ github.ref_name }}
+          path: windows-regression-tests.log
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Run core regression tests (macOS)
         if: runner.os == 'macOS'
