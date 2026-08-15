@@ -159,7 +159,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          stale_asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}/assets" --paginate --jq '.[] | select(.name == "windows-regression-tests.log") | .id')"
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.id')"
+          stale_asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate --jq '.[] | select(.name == "windows-regression-tests.log") | .id')"
           for asset_id in ${stale_asset_ids}; do
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
           done
