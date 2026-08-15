@@ -42,7 +42,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
-          $packageName = "浏览器痕迹分析-v1.2.0-test1-Windows-x64"
+          $packageName = "浏览器痕迹分析-v1.2.0-test2-Windows-x64"
           $stage = "package/$packageName"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
@@ -53,7 +53,7 @@ jobs:
       - name: Upload Windows test package
         uses: actions/upload-artifact@v4
         with:
-          name: 浏览器痕迹分析-v1.2.0-test1-Windows-x64
+          name: 浏览器痕迹分析-v1.2.0-test2-Windows-x64
           path: package/*.zip
           if-no-files-found: error
           retention-days: 14

@@ -25,10 +25,15 @@ from tkinter import filedialog, messagebox, ttk
 # =================================================
 # 0. 全局配置
 # =================================================
-APP_VERSION = "1.2.0-test1"
+APP_VERSION = "1.2.0-test2"
 MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
 MAX_RULE_COUNT = 250_000
 MAX_MATCHES = 100_000
+# 单个异常 Profile 不能无限占用扫描线程；限制会写入无敏感诊断信息。
+PROFILE_SCAN_BUDGET_SECONDS = 12.0
+SESSION_SCAN_BUDGET_SECONDS = 180.0
+SNAPSHOT_BUDGET_SECONDS = 4.0
+MAX_URL_ROWS_PER_TABLE = 100_000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,6 +186,10 @@ class ResourceManager:
 # =================================================
 # 2. 扫描内核
 # =================================================
+class ScanBudgetExceeded(RuntimeError):
+    """单个 Profile 的可控扫描时间预算已耗尽。"""
+
+
 class ScannerCore:
     """浏览器资料发现和只读扫描内核。
 
@@ -541,36 +550,52 @@ class ScannerCore:
         cls._record("info", "扩展发现", f"本地/可移动盘便携目录搜索{reason}，新增 {len(profiles)} 个配置。")
         return profiles
 
-    @classmethod
-    def _snapshot_database(cls, db_path: Path, temp_dir: Path) -> Optional[Path]:
-        """通过 SQLite Online Backup API 建立一致的只读快照。
+    @staticmethod
+    def _remaining_seconds(deadline: Optional[float], default: float = 5.0) -> float:
+        if deadline is None:
+            return default
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ScanBudgetExceeded("扫描时间预算已耗尽")
+        return min(default, max(0.1, remaining))
 
-        此方法会读取 WAL 中已提交的内容，不会修改浏览器的主库、WAL 或 SHM 文件。
-        """
-        if not db_path.is_file():
-            cls._record("warning", "数据库", f"未找到数据库文件：{db_path.name}")
+    @classmethod
+    def _snapshot_database(cls, db_path: Path, temp_dir: Path, deadline: Optional[float] = None) -> Optional[Path]:
+        """通过 SQLite Online Backup API 建立一致的只读快照，并受单配置预算约束。"""
+        try:
+            if not db_path.is_file():
+                cls._record("warning", "数据库", f"未找到数据库文件：{db_path.name}")
+                return None
+        except OSError as exc:
+            cls._record("warning", "数据库", f"无法访问 {db_path.name}：{type(exc).__name__}: {exc}")
             return None
 
+        snapshot_deadline = min(deadline, time.monotonic() + SNAPSHOT_BUDGET_SECONDS) if deadline else time.monotonic() + SNAPSHOT_BUDGET_SECONDS
         target = temp_dir / f"audit_db_{time.time_ns()}.sqlite"
         source: Optional[sqlite3.Connection] = None
         destination: Optional[sqlite3.Connection] = None
+        snapshot_ready = False
         try:
             db_uri = db_path.resolve().as_uri() + "?mode=ro"
-            source = sqlite3.connect(db_uri, uri=True, timeout=5.0)
-            source.execute("PRAGMA busy_timeout = 5000")
-            destination = sqlite3.connect(str(target), timeout=5.0)
-            source.backup(destination, pages=128, sleep=0.05)
+            source = sqlite3.connect(db_uri, uri=True, timeout=cls._remaining_seconds(snapshot_deadline))
+            source.execute(f"PRAGMA busy_timeout = {int(cls._remaining_seconds(snapshot_deadline) * 1000)}")
+            destination = sqlite3.connect(str(target), timeout=cls._remaining_seconds(snapshot_deadline))
+
+            def backup_progress(_: int, __: int, ___: int) -> None:
+                cls._remaining_seconds(snapshot_deadline)
+
+            source.backup(destination, pages=128, progress=backup_progress, sleep=0.02)
             destination.close()
             destination = None
             source.close()
             source = None
+            snapshot_ready = True
             return target
+        except ScanBudgetExceeded:
+            cls._record("warning", "数据库", f"{db_path.name} 一致性快照超时，已跳过该配置。")
+            return None
         except (sqlite3.Error, OSError, ValueError) as exc:
             cls._record("error", "数据库", f"{db_path.name} 一致性快照失败：{type(exc).__name__}: {exc}")
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
             return None
         finally:
             if destination is not None:
@@ -583,6 +608,12 @@ class ScannerCore:
                     source.close()
                 except sqlite3.Error:
                     pass
+            if not snapshot_ready:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
 
     @classmethod
     def _collect_explicit_paths(cls, paths: List[Path], seen_paths: Set[str]) -> List[Dict[str, str]]:
@@ -616,10 +647,36 @@ class ScannerCore:
                             {"b": "Firefox(手动)", "p": selected.name, "path": str(selected), "type": "F", "source": "手动选择路径"}
                         )
                     continue
-                if cls._is_valid_user_data(selected):
-                    profiles.extend(cls._collect_chrome_profiles(selected, cls._infer_browser_name(selected), seen_paths, "手动选择路径"))
-                else:
-                    cls._record("warning", "手动路径", f"目录不是可识别的浏览器 Profile 或 User Data 根目录：{selected.name}")
+                # 用户常会选择 Google、Chrome 或 LocalAppData 等上级目录；仅做两层受控展开，
+                # 不递归遍历磁盘，仍保持最小范围和可预测性能。
+                user_data_candidates = [selected]
+                try:
+                    for child in selected.iterdir():
+                        if child.is_dir():
+                            user_data_candidates.append(child / "User Data")
+                            for grandchild in child.iterdir():
+                                if grandchild.is_dir():
+                                    user_data_candidates.append(grandchild / "User Data")
+                except (OSError, PermissionError) as exc:
+                    cls._record("warning", "手动路径", f"无法枚举所选目录：{exc}")
+
+                before_count = len(profiles)
+                candidate_keys: Set[str] = set()
+                for user_data_dir in user_data_candidates:
+                    candidate_key = cls._normalise_path_key(user_data_dir)
+                    if candidate_key in candidate_keys or not cls._is_valid_user_data(user_data_dir):
+                        continue
+                    candidate_keys.add(candidate_key)
+                    profiles.extend(
+                        cls._collect_chrome_profiles(
+                            user_data_dir,
+                            cls._infer_browser_name(user_data_dir.parent),
+                            seen_paths,
+                            "手动选择路径",
+                        )
+                    )
+                if len(profiles) == before_count:
+                    cls._record("warning", "手动路径", f"目录不是可识别的浏览器 Profile、User Data 或其上级目录：{selected.name}")
             except (OSError, PermissionError) as exc:
                 cls._record("warning", "手动路径", f"无法读取所选目录：{exc}")
         if paths:
@@ -673,16 +730,34 @@ class ScannerCore:
         return profiles
 
     @classmethod
-    def _read_urls(cls, cursor: sqlite3.Cursor, query: str, profile: Dict[str, str], info_type: str, rules: Dict[str, str], hits: List[Tuple]) -> None:
+    def _read_urls(
+        cls,
+        cursor: sqlite3.Cursor,
+        query: str,
+        profile: Dict[str, str],
+        info_type: str,
+        rules: Dict[str, str],
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> None:
+        cls._remaining_seconds(deadline)
         cursor.execute(query)
-        while True:
-            rows = cursor.fetchmany(5000)
+        processed = 0
+        while processed < MAX_URL_ROWS_PER_TABLE:
+            cls._remaining_seconds(deadline)
+            rows = cursor.fetchmany(min(1000, MAX_URL_ROWS_PER_TABLE - processed))
             if not rows:
-                break
+                return
+            processed += len(rows)
             for row in rows:
                 for value in row:
                     if value:
                         cls._match(str(value), info_type, profile, rules, hits)
+        cls._record(
+            "warning",
+            "读取限额",
+            f"{profile['b']} / {profile['p']} 的 {info_type} 已读取 {MAX_URL_ROWS_PER_TABLE} 行，超出部分已跳过。",
+        )
 
     @staticmethod
     def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> Set[str]:
@@ -690,7 +765,14 @@ class ScannerCore:
         return {str(row[1]) for row in cursor.fetchall()}
 
     @classmethod
-    def _scan_chromium_downloads(cls, cursor: sqlite3.Cursor, profile: Dict[str, str], rules: Dict[str, str], hits: List[Tuple]) -> None:
+    def _scan_chromium_downloads(
+        cls,
+        cursor: sqlite3.Cursor,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> None:
         try:
             columns = cls._table_columns(cursor, "downloads")
             if columns:
@@ -703,28 +785,42 @@ class ScannerCore:
                         "下载文件",
                         rules,
                         hits,
+                        deadline,
                     )
         except sqlite3.Error as exc:
             cls._record("info", "下载记录", f"{profile['b']} / {profile['p']} 的 downloads 表不可用：{exc}")
 
         try:
-            cls._read_urls(cursor, "SELECT url FROM downloads_url_chains", profile, "下载文件", rules, hits)
+            cls._read_urls(cursor, "SELECT url FROM downloads_url_chains", profile, "下载文件", rules, hits, deadline)
         except sqlite3.Error:
             # 旧版 Chromium 可能没有 downloads_url_chains，此处属于可预期兼容分支。
             pass
 
     @classmethod
-    def _scan_chromium(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+    def _scan_chromium(
+        cls,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        temp_dir: Path,
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "History", temp_dir)
+        snapshot = cls._snapshot_database(profile_path / "History", temp_dir, deadline)
         if snapshot is None:
             return
         connection: Optional[sqlite3.Connection] = None
         try:
-            connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+            connection = sqlite3.connect(
+                snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
+            )
             cursor = connection.cursor()
-            cls._read_urls(cursor, "SELECT url FROM urls WHERE url IS NOT NULL", profile, "历史记录", rules, hits)
-            cls._scan_chromium_downloads(cursor, profile, rules, hits)
+            cls._read_urls(
+                cursor, "SELECT url FROM urls WHERE url IS NOT NULL", profile, "历史记录", rules, hits, deadline
+            )
+            cls._scan_chromium_downloads(cursor, profile, rules, hits, deadline)
+        except ScanBudgetExceeded:
+            raise
         except sqlite3.Error as exc:
             cls._record("error", "数据库", f"{profile['b']} / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
         finally:
@@ -737,6 +833,9 @@ class ScannerCore:
                 snapshot.unlink(missing_ok=True)
             except OSError as exc:
                 cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ScanBudgetExceeded("历史数据库读取后时间预算已耗尽")
 
         bookmark_path = profile_path / "Bookmarks"
         if bookmark_path.is_file():
@@ -763,16 +862,27 @@ class ScannerCore:
                 cls._record("warning", "书签", f"{profile['b']} / {profile['p']} 书签解析失败：{exc}")
 
     @classmethod
-    def _scan_firefox(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+    def _scan_firefox(
+        cls,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        temp_dir: Path,
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "places.sqlite", temp_dir)
+        snapshot = cls._snapshot_database(profile_path / "places.sqlite", temp_dir, deadline)
         if snapshot is None:
             return
         connection: Optional[sqlite3.Connection] = None
         try:
-            connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+            connection = sqlite3.connect(
+                snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
+            )
             cursor = connection.cursor()
-            cls._read_urls(cursor, "SELECT url FROM moz_places WHERE url IS NOT NULL", profile, "历史记录", rules, hits)
+            cls._read_urls(
+                cursor, "SELECT url FROM moz_places WHERE url IS NOT NULL", profile, "历史记录", rules, hits, deadline
+            )
             try:
                 cls._read_urls(
                     cursor,
@@ -790,9 +900,12 @@ class ScannerCore:
                     "下载文件",
                     rules,
                     hits,
+                    deadline,
                 )
             except sqlite3.Error:
                 pass
+        except ScanBudgetExceeded:
+            raise
         except sqlite3.Error as exc:
             cls._record("error", "数据库", f"Firefox / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
         finally:
@@ -807,22 +920,31 @@ class ScannerCore:
                 cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
 
     @classmethod
-    def _scan_safari(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path, hits: List[Tuple]) -> None:
+    def _scan_safari(
+        cls,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        temp_dir: Path,
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "History.db", temp_dir)
+        snapshot = cls._snapshot_database(profile_path / "History.db", temp_dir, deadline)
         if snapshot is not None:
             connection: Optional[sqlite3.Connection] = None
             try:
-                connection = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+                connection = sqlite3.connect(
+                    snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
+                )
                 cursor = connection.cursor()
                 try:
                     query = """
                         SELECT DISTINCT history_items.url FROM history_items
                         INNER JOIN history_visits ON history_items.id = history_visits.history_item
                     """
-                    cls._read_urls(cursor, query, profile, "历史记录", rules, hits)
+                    cls._read_urls(cursor, query, profile, "历史记录", rules, hits, deadline)
                 except sqlite3.Error:
-                    cls._read_urls(cursor, "SELECT url FROM history_items", profile, "历史记录", rules, hits)
+                    cls._read_urls(cursor, "SELECT url FROM history_items", profile, "历史记录", rules, hits, deadline)
             except sqlite3.Error as exc:
                 cls._record("error", "数据库", f"Safari 读取失败：{type(exc).__name__}: {exc}")
             finally:
@@ -859,13 +981,28 @@ class ScannerCore:
 
     @classmethod
     def scan(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path) -> List[Tuple]:
+        """扫描单个 Profile；任何异常均仅影响当前配置，绝不终止全局扫描。"""
         hits: List[Tuple] = []
-        if profile["type"] == "C":
-            cls._scan_chromium(profile, rules, temp_dir, hits)
-        elif profile["type"] == "F":
-            cls._scan_firefox(profile, rules, temp_dir, hits)
-        elif profile["type"] == "S":
-            cls._scan_safari(profile, rules, temp_dir, hits)
+        started_at = time.monotonic()
+        deadline = started_at + PROFILE_SCAN_BUDGET_SECONDS
+        profile_label = f"{profile.get('b', '未知浏览器')} / {profile.get('p', '未知配置')}"
+        try:
+            if profile["type"] == "C":
+                cls._scan_chromium(profile, rules, temp_dir, hits, deadline)
+            elif profile["type"] == "F":
+                cls._scan_firefox(profile, rules, temp_dir, hits, deadline)
+            elif profile["type"] == "S":
+                cls._scan_safari(profile, rules, temp_dir, hits, deadline)
+        except ScanBudgetExceeded:
+            cls._record("warning", "扫描限时", f"{profile_label} 超过 {PROFILE_SCAN_BUDGET_SECONDS:.0f} 秒预算，已跳过剩余记录并继续下一个配置。")
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            cls._record("error", "配置隔离", f"{profile_label} 已跳过：{type(exc).__name__}: {exc}")
+        except Exception as exc:  # 最后的配置级保护，防止未知格式破坏整批审计。
+            logger.exception("Profile 扫描异常：%s", profile_label)
+            cls._record("error", "配置隔离", f"{profile_label} 出现未预期异常，已跳过：{type(exc).__name__}: {exc}")
+        finally:
+            elapsed = time.monotonic() - started_at
+            cls._record("info", "扫描进度", f"{profile_label} 已处理，用时 {elapsed:.1f} 秒，命中 {len(hits)} 条。")
         return hits
 
     @classmethod
@@ -910,6 +1047,7 @@ class App(tk.Tk):
         self.extended_scan_var = tk.BooleanVar(value=False)
         self.selected_paths: List[Path] = []
         self.last_profile_count = 0
+        self.last_processed_count = 0
 
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -986,6 +1124,7 @@ class App(tk.Tk):
         self.all_hits.clear()
         self.is_scanning = True
         self.last_profile_count = 0
+        self.last_processed_count = 0
         include_extended = self.extended_scan_var.get()
         extra_paths = list(self.selected_paths)
         rules = ResourceManager.load_audit_rules()
@@ -999,14 +1138,28 @@ class App(tk.Tk):
                     return
 
                 final_results: List[Tuple] = []
+                processed_count = 0
+                session_deadline = time.monotonic() + SESSION_SCAN_BUDGET_SECONDS
                 for index, profile in enumerate(profiles):
                     if not self.is_scanning:
                         break
-                    self.queue.put(("msg", f"正在读取：{profile['b']} → {profile['p']}"))
+                    if time.monotonic() >= session_deadline:
+                        remaining_count = len(profiles) - processed_count
+                        ScannerCore._record(
+                            "warning",
+                            "总扫描限时",
+                            f"已达到 {SESSION_SCAN_BUDGET_SECONDS:.0f} 秒总预算，跳过剩余 {remaining_count} 个配置。",
+                        )
+                        self.queue.put(("msg", f"达到总扫描时间预算，已跳过剩余 {remaining_count} 个配置。"))
+                        break
+                    self.queue.put(("msg", f"正在读取（{index + 1}/{len(profiles)}）：{profile['b']} → {profile['p']}"))
                     final_results.extend(ScannerCore.scan(profile, rules, self.core_temp_dir))
-                    self.queue.put(("progress", int((index + 1) / len(profiles) * 100)))
+                    processed_count += 1
+                    self.queue.put(("progress", int(processed_count / len(profiles) * 100)))
+                    self.queue.put(("msg", f"已处理 {processed_count}/{len(profiles)}：{profile['b']} → {profile['p']}"))
 
                 if self.is_scanning:
+                    self.queue.put(("scan_summary", processed_count))
                     self.queue.put(("done", final_results))
             except Exception as exc:  # 保留最上层保护，完整异常会进入日志与诊断。
                 logger.exception("扫描核心异常")
@@ -1079,6 +1232,8 @@ class App(tk.Tk):
                 elif message_type == "discovery":
                     self.last_profile_count = int(value)
                     self.status_lbl.config(text=f"已识别 {self.last_profile_count} 个浏览器配置，正在读取数据库。")
+                elif message_type == "scan_summary":
+                    self.last_processed_count = int(value)
                 elif message_type == "done":
                     self.btn_run.config(state="normal")
                     self.all_hits = value
@@ -1092,10 +1247,10 @@ class App(tk.Tk):
                         )
                     elif self.all_hits:
                         self.execute_instant_report()
-                        self.status_lbl.config(text=f"完成：识别 {self.last_profile_count} 个配置，命中 {len(self.all_hits)} 条记录，报告已在浏览器打开。")
+                        self.status_lbl.config(text=f"完成：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，命中 {len(self.all_hits)} 条记录，报告已在浏览器打开。")
                     else:
-                        self.status_lbl.config(text=f"扫描完成：已读取 {self.last_profile_count} 个配置，未发现符合当前规则的留痕。")
-                        messagebox.showinfo("检测结果", "已读取浏览器配置，但没有匹配到当前规则库中的记录。")
+                        self.status_lbl.config(text=f"扫描完成：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，未发现符合当前规则的留痕。")
+                        messagebox.showinfo("检测结果", f"已处理 {self.last_processed_count}/{self.last_profile_count} 个浏览器配置，但没有匹配到当前规则库中的记录。")
                 elif message_type == "error":
                     self.btn_run.config(state="normal")
                     self.status_lbl.config(text=f"扫描异常中断：{value}。请复制诊断信息反馈。")

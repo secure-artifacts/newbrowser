@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -148,6 +149,78 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(len(profiles), 1)
         self.assertEqual(profiles[0]["path"], str(profile))
         self.assertEqual(profiles[0]["source"], "手动选择路径")
+
+    def test_manual_google_parent_directory_is_recognised(self):
+        google_dir = self.root / "Google"
+        profile = google_dir / "Chrome" / "User Data" / "Default"
+        profile.mkdir(parents=True)
+        (profile / "History").write_bytes(b"SQLite format 3\\x00")
+
+        ScannerCore._reset_diagnostics()
+        profiles = ScannerCore._collect_explicit_paths([google_dir], set())
+        self.assertEqual(len(profiles), 1)
+        self.assertIn("Chrome", profiles[0]["b"])
+        self.assertEqual(profiles[0]["source"], "手动选择路径")
+        self.assertNotIn("目录不是可识别", ScannerCore.diagnostics_text())
+
+    def test_invalid_database_is_isolated_from_following_profile(self):
+        invalid_profile = self.root / "Invalid"
+        invalid_profile.mkdir()
+        (invalid_profile / "History").write_bytes(b"not-a-sqlite-file")
+        valid_profile = self.root / "Valid"
+        valid_profile.mkdir()
+        database = sqlite3.connect(valid_profile / "History")
+        database.execute("CREATE TABLE urls (url TEXT)")
+        database.execute("INSERT INTO urls(url) VALUES (?)", ("https://isolated.example.test/ok",))
+        database.commit()
+        database.close()
+
+        ScannerCore._reset_diagnostics()
+        bad = {"b": "Chrome", "p": "Invalid", "path": str(invalid_profile), "type": "C", "source": "测试"}
+        good = {"b": "Chrome", "p": "Valid", "path": str(valid_profile), "type": "C", "source": "测试"}
+        self.assertEqual(ScannerCore.scan(bad, {"isolated.example.test": "命中"}, self.root), [])
+        good_hits = ScannerCore.scan(good, {"isolated.example.test": "命中"}, self.root)
+        self.assertEqual(len(good_hits), 1)
+        self.assertIn("一致性快照失败", ScannerCore.diagnostics_text())
+
+    def test_expired_snapshot_budget_skips_profile_quickly(self):
+        database = sqlite3.connect(self.root / "History")
+        database.execute("CREATE TABLE urls (url TEXT)")
+        database.commit()
+        database.close()
+
+        ScannerCore._reset_diagnostics()
+        started = time.monotonic()
+        snapshot = ScannerCore._snapshot_database(self.root / "History", self.root, time.monotonic() - 0.01)
+        self.assertIsNone(snapshot)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIn("一致性快照超时", ScannerCore.diagnostics_text())
+
+    def test_url_row_limit_records_diagnostic_without_hanging(self):
+        database = sqlite3.connect(self.root / "limit.sqlite")
+        database.execute("CREATE TABLE urls (url TEXT)")
+        database.executemany("INSERT INTO urls(url) VALUES (?)", [(f"https://row{i}.example.test/",) for i in range(5)])
+        database.commit()
+        cursor = database.cursor()
+        original_limit = MODULE.MAX_URL_ROWS_PER_TABLE
+        try:
+            MODULE.MAX_URL_ROWS_PER_TABLE = 2
+            ScannerCore._reset_diagnostics()
+            hits = []
+            ScannerCore._read_urls(
+                cursor,
+                "SELECT url FROM urls",
+                {"b": "Chrome", "p": "Default"},
+                "历史记录",
+                {"example.test": "命中"},
+                hits,
+                time.monotonic() + 1.0,
+            )
+        finally:
+            MODULE.MAX_URL_ROWS_PER_TABLE = original_limit
+            database.close()
+        self.assertEqual(len(hits), 2)
+        self.assertIn("读取限额", ScannerCore.diagnostics_text())
 
     def test_chromium_candidate_layouts_cover_non_stable_channels(self):
         candidates = ScannerCore._chromium_candidate_dirs(self.root)
