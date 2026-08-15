@@ -129,8 +129,9 @@ jobs:
           cd dist_final
           zip -r "${{ matrix.asset_name }}-${{ github.ref_name }}.zip" "${folder_name}"
 
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      # 证明直接绑定随后将上传至 Release 的最终 ZIP；中间 Actions Artifact 仅用于跨 Job 传输。
+      - name: Attest final Release ZIP
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: dist_final/*.zip
 
