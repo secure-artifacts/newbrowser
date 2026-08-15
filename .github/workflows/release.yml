@@ -168,3 +168,16 @@ jobs:
         with:
           files: artifacts/newbrowser-*.zip
           generate_release_notes: true
+
+      # 在 Release 创建后再次清除任何非 ZIP 诊断资产，作为正式资产白名单的最终门禁。
+      - name: Enforce release asset allowlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.id')"
+          stale_asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate --jq '.[] | select(.name | endswith(".zip") | not) | .id')"
+          for asset_id in ${stale_asset_ids}; do
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+          done
+          remaining_names="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate --jq '.[].name')"
+          test "$(printf '%s\n' "${remaining_names}" | grep -c '\\.zip$')" -eq 3
