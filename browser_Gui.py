@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 # =================================================
 # 0. 全局配置
 # =================================================
-APP_VERSION = "1.2.0-test2"
+APP_VERSION = "1.1.8"
 MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
 MAX_RULE_COUNT = 250_000
 MAX_MATCHES = 100_000
@@ -252,25 +252,47 @@ class ScannerCore:
         ),
     )
     _diagnostics: List[Dict[str, str]] = []
+    _diagnostic_lock = threading.Lock()
 
     @classmethod
     def _reset_diagnostics(cls) -> None:
-        cls._diagnostics = []
+        with cls._diagnostic_lock:
+            cls._diagnostics = []
+
+    @staticmethod
+    def _diagnostic_profile_label(profile: Dict[str, str]) -> str:
+        """诊断只保留 Profile 技术标识，避免复制时携带 Local State 中的账号显示名。"""
+        browser_name = str(profile.get("b", "未知浏览器"))[:80]
+        profile_name = re.split(r"[（(]", str(profile.get("p", "未知配置")), maxsplit=1)[0].strip()[:80]
+        return f"{browser_name} / {profile_name or 'Profile'}"
+
+    @staticmethod
+    def _safe_error_summary(exc: BaseException) -> str:
+        """诊断保留可行动的错误类型/代码，不复制可能含用户名或路径的异常原文。"""
+        code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+        return f"{type(exc).__name__}" + (f"（错误代码 {code}）" if code is not None else "")
 
     @classmethod
     def _record(cls, level: str, stage: str, message: str) -> None:
-        cls._diagnostics.append({"level": level, "stage": stage, "message": message})
+        event = {"level": level, "stage": stage, "message": message[:500]}
+        with cls._diagnostic_lock:
+            cls._diagnostics.append(event)
+            if len(cls._diagnostics) > 200:
+                cls._diagnostics = cls._diagnostics[-200:]
         log_method = logger.warning if level in {"warning", "error"} else logger.info
-        log_method("[%s] %s", stage, message)
+        log_method("[%s] %s", stage, event["message"])
 
     @classmethod
     def diagnostics_text(cls) -> str:
-        if not cls._diagnostics:
+        with cls._diagnostic_lock:
+            events = list(cls._diagnostics[-80:])
+        if not events:
             return "诊断信息：尚未执行扫描。"
         lines = [f"浏览器痕迹分析诊断（{APP_VERSION}）"]
-        for event in cls._diagnostics[-80:]:
+        for event in events:
             lines.append(f"[{event['level'].upper()}][{event['stage']}] {event['message']}")
         return "\n".join(lines)
+
 
     @staticmethod
     def _normalise_path_key(path: Path) -> str:
@@ -359,7 +381,7 @@ class ScannerCore:
                     }
                 )
         except (OSError, PermissionError) as exc:
-            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{exc}")
+            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{cls._safe_error_summary(exc)}")
         return found
 
     @classmethod
@@ -379,7 +401,7 @@ class ScannerCore:
                     {"b": browser_name, "p": sub.name, "path": str(sub), "type": "F", "source": source}
                 )
         except (OSError, PermissionError) as exc:
-            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{exc}")
+            cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{cls._safe_error_summary(exc)}")
         return found
 
     @classmethod
@@ -455,7 +477,7 @@ class ScannerCore:
             try:
                 user_dirs = list(users_root.iterdir())
             except (OSError, PermissionError) as exc:
-                cls._record("warning", "扩展发现", f"无法枚举 Windows 用户目录：{exc}")
+                cls._record("warning", "扩展发现", f"无法枚举 Windows 用户目录：{cls._safe_error_summary(exc)}")
                 continue
             for user_dir in user_dirs:
                 if not user_dir.is_dir() or user_dir.name.lower() in ignored:
@@ -567,7 +589,7 @@ class ScannerCore:
                 cls._record("warning", "数据库", f"未找到数据库文件：{db_path.name}")
                 return None
         except OSError as exc:
-            cls._record("warning", "数据库", f"无法访问 {db_path.name}：{type(exc).__name__}: {exc}")
+            cls._record("warning", "数据库", f"无法访问 {db_path.name}：{cls._safe_error_summary(exc)}")
             return None
 
         snapshot_deadline = min(deadline, time.monotonic() + SNAPSHOT_BUDGET_SECONDS) if deadline else time.monotonic() + SNAPSHOT_BUDGET_SECONDS
@@ -595,7 +617,7 @@ class ScannerCore:
             cls._record("warning", "数据库", f"{db_path.name} 一致性快照超时，已跳过该配置。")
             return None
         except (sqlite3.Error, OSError, ValueError) as exc:
-            cls._record("error", "数据库", f"{db_path.name} 一致性快照失败：{type(exc).__name__}: {exc}")
+            cls._record("error", "数据库", f"{db_path.name} 一致性快照失败：{cls._safe_error_summary(exc)}")
             return None
         finally:
             if destination is not None:
@@ -623,7 +645,7 @@ class ScannerCore:
             try:
                 selected = selected_path.expanduser()
                 if not selected.is_dir():
-                    cls._record("warning", "手动路径", f"所选目录不存在或不可访问：{selected}")
+                    cls._record("warning", "手动路径", f"所选目录不存在或不可访问：{selected.name}")
                     continue
                 if (selected / "History").is_file():
                     path_key = cls._normalise_path_key(selected)
@@ -658,7 +680,7 @@ class ScannerCore:
                                 if grandchild.is_dir():
                                     user_data_candidates.append(grandchild / "User Data")
                 except (OSError, PermissionError) as exc:
-                    cls._record("warning", "手动路径", f"无法枚举所选目录：{exc}")
+                    cls._record("warning", "手动路径", f"无法枚举所选目录：{cls._safe_error_summary(exc)}")
 
                 before_count = len(profiles)
                 candidate_keys: Set[str] = set()
@@ -678,7 +700,7 @@ class ScannerCore:
                 if len(profiles) == before_count:
                     cls._record("warning", "手动路径", f"目录不是可识别的浏览器 Profile、User Data 或其上级目录：{selected.name}")
             except (OSError, PermissionError) as exc:
-                cls._record("warning", "手动路径", f"无法读取所选目录：{exc}")
+                cls._record("warning", "手动路径", f"无法读取所选目录：{cls._safe_error_summary(exc)}")
         if paths:
             cls._record("info", "手动路径", f"手动路径检查完成：新增 {len(profiles)} 个配置。")
         return profiles
@@ -756,7 +778,7 @@ class ScannerCore:
         cls._record(
             "warning",
             "读取限额",
-            f"{profile['b']} / {profile['p']} 的 {info_type} 已读取 {MAX_URL_ROWS_PER_TABLE} 行，超出部分已跳过。",
+            f"{cls._diagnostic_profile_label(profile)} 的 {info_type} 已读取 {MAX_URL_ROWS_PER_TABLE} 行，超出部分已跳过。",
         )
 
     @staticmethod
@@ -788,7 +810,7 @@ class ScannerCore:
                         deadline,
                     )
         except sqlite3.Error as exc:
-            cls._record("info", "下载记录", f"{profile['b']} / {profile['p']} 的 downloads 表不可用：{exc}")
+            cls._record("info", "下载记录", f"{cls._diagnostic_profile_label(profile)} 的 downloads 表不可用：{cls._safe_error_summary(exc)}")
 
         try:
             cls._read_urls(cursor, "SELECT url FROM downloads_url_chains", profile, "下载文件", rules, hits, deadline)
@@ -822,7 +844,7 @@ class ScannerCore:
         except ScanBudgetExceeded:
             raise
         except sqlite3.Error as exc:
-            cls._record("error", "数据库", f"{profile['b']} / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
+            cls._record("error", "数据库", f"{cls._diagnostic_profile_label(profile)} 读取失败：{cls._safe_error_summary(exc)}")
         finally:
             if connection is not None:
                 try:
@@ -832,7 +854,7 @@ class ScannerCore:
             try:
                 snapshot.unlink(missing_ok=True)
             except OSError as exc:
-                cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+                cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
 
         if deadline is not None and time.monotonic() >= deadline:
             raise ScanBudgetExceeded("历史数据库读取后时间预算已耗尽")
@@ -859,7 +881,7 @@ class ScannerCore:
                     for root in roots.values():
                         walk(root)
             except (OSError, ValueError, TypeError) as exc:
-                cls._record("warning", "书签", f"{profile['b']} / {profile['p']} 书签解析失败：{exc}")
+                cls._record("warning", "书签", f"{cls._diagnostic_profile_label(profile)} 书签解析失败：{cls._safe_error_summary(exc)}")
 
     @classmethod
     def _scan_firefox(
@@ -907,7 +929,7 @@ class ScannerCore:
         except ScanBudgetExceeded:
             raise
         except sqlite3.Error as exc:
-            cls._record("error", "数据库", f"Firefox / {profile['p']} 读取失败：{type(exc).__name__}: {exc}")
+            cls._record("error", "数据库", f"{cls._diagnostic_profile_label(profile)} 读取失败：{cls._safe_error_summary(exc)}")
         finally:
             if connection is not None:
                 try:
@@ -917,7 +939,7 @@ class ScannerCore:
             try:
                 snapshot.unlink(missing_ok=True)
             except OSError as exc:
-                cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+                cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
 
     @classmethod
     def _scan_safari(
@@ -946,7 +968,7 @@ class ScannerCore:
                 except sqlite3.Error:
                     cls._read_urls(cursor, "SELECT url FROM history_items", profile, "历史记录", rules, hits, deadline)
             except sqlite3.Error as exc:
-                cls._record("error", "数据库", f"Safari 读取失败：{type(exc).__name__}: {exc}")
+                cls._record("error", "数据库", f"Safari 读取失败：{cls._safe_error_summary(exc)}")
             finally:
                 if connection is not None:
                     try:
@@ -956,7 +978,7 @@ class ScannerCore:
                 try:
                     snapshot.unlink(missing_ok=True)
                 except OSError as exc:
-                    cls._record("warning", "清理", f"临时数据库清理失败：{exc}")
+                    cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
 
         plist_path = profile_path / "Bookmarks.plist"
         if plist_path.is_file():
@@ -977,7 +999,7 @@ class ScannerCore:
 
                 walk(plist_data)
             except (OSError, ValueError, TypeError) as exc:
-                cls._record("warning", "书签", f"Safari 书签解析失败：{exc}")
+                cls._record("warning", "书签", f"Safari 书签解析失败：{cls._safe_error_summary(exc)}")
 
     @classmethod
     def scan(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path) -> List[Tuple]:
@@ -985,7 +1007,7 @@ class ScannerCore:
         hits: List[Tuple] = []
         started_at = time.monotonic()
         deadline = started_at + PROFILE_SCAN_BUDGET_SECONDS
-        profile_label = f"{profile.get('b', '未知浏览器')} / {profile.get('p', '未知配置')}"
+        profile_label = cls._diagnostic_profile_label(profile)
         try:
             if profile["type"] == "C":
                 cls._scan_chromium(profile, rules, temp_dir, hits, deadline)
@@ -996,10 +1018,10 @@ class ScannerCore:
         except ScanBudgetExceeded:
             cls._record("warning", "扫描限时", f"{profile_label} 超过 {PROFILE_SCAN_BUDGET_SECONDS:.0f} 秒预算，已跳过剩余记录并继续下一个配置。")
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
-            cls._record("error", "配置隔离", f"{profile_label} 已跳过：{type(exc).__name__}: {exc}")
+            cls._record("error", "配置隔离", f"{profile_label} 已跳过：{cls._safe_error_summary(exc)}")
         except Exception as exc:  # 最后的配置级保护，防止未知格式破坏整批审计。
             logger.exception("Profile 扫描异常：%s", profile_label)
-            cls._record("error", "配置隔离", f"{profile_label} 出现未预期异常，已跳过：{type(exc).__name__}: {exc}")
+            cls._record("error", "配置隔离", f"{profile_label} 出现未预期异常，已跳过：{cls._safe_error_summary(exc)}")
         finally:
             elapsed = time.monotonic() - started_at
             cls._record("info", "扫描进度", f"{profile_label} 已处理，用时 {elapsed:.1f} 秒，命中 {len(hits)} 条。")
@@ -1061,7 +1083,7 @@ class App(tk.Tk):
         tk.Label(header, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
         tk.Label(
             header,
-            text="v1.2 测试版：Chrome 多通道识别、WAL 一致性读取与可复制诊断",
+            text="v1.1.8：多浏览器兼容识别、异常 Profile 隔离与可复制诊断",
             font=("Arial", 9),
             fg="#555",
         ).pack(anchor="w", pady=(2, 0))
@@ -1153,7 +1175,19 @@ class App(tk.Tk):
                         self.queue.put(("msg", f"达到总扫描时间预算，已跳过剩余 {remaining_count} 个配置。"))
                         break
                     self.queue.put(("msg", f"正在读取（{index + 1}/{len(profiles)}）：{profile['b']} → {profile['p']}"))
-                    final_results.extend(ScannerCore.scan(profile, rules, self.core_temp_dir))
+                    profile_hits = ScannerCore.scan(profile, rules, self.core_temp_dir)
+                    remaining_hits = MAX_MATCHES - len(final_results)
+                    if remaining_hits > 0:
+                        final_results.extend(profile_hits[:remaining_hits])
+                    if len(final_results) >= MAX_MATCHES:
+                        ScannerCore._record(
+                            "warning",
+                            "命中限额",
+                            f"已达到全局命中上限 {MAX_MATCHES} 条，停止扫描剩余配置以保护内存。",
+                        )
+                        processed_count += 1
+                        self.queue.put(("progress", int(processed_count / len(profiles) * 100)))
+                        break
                     processed_count += 1
                     self.queue.put(("progress", int(processed_count / len(profiles) * 100)))
                     self.queue.put(("msg", f"已处理 {processed_count}/{len(profiles)}：{profile['b']} → {profile['p']}"))
@@ -1163,7 +1197,7 @@ class App(tk.Tk):
                     self.queue.put(("done", final_results))
             except Exception as exc:  # 保留最上层保护，完整异常会进入日志与诊断。
                 logger.exception("扫描核心异常")
-                ScannerCore._record("error", "扫描", f"扫描中断：{type(exc).__name__}: {exc}")
+                ScannerCore._record("error", "扫描", f"扫描中断：{ScannerCore._safe_error_summary(exc)}")
                 self.queue.put(("error", str(exc)))
             finally:
                 self.is_scanning = False
@@ -1215,7 +1249,7 @@ class App(tk.Tk):
             else:
                 webbrowser.open(target_path.as_uri())
         except OSError as exc:
-            ScannerCore._record("error", "报告", f"报告生成失败：{exc}")
+            ScannerCore._record("error", "报告", f"报告生成失败：{ScannerCore._safe_error_summary(exc)}")
             messagebox.showerror("报告生成失败", str(exc))
 
     def _process_queue(self) -> None:

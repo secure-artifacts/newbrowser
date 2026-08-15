@@ -183,6 +183,23 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(len(good_hits), 1)
         self.assertIn("一致性快照失败", ScannerCore.diagnostics_text())
 
+    def test_diagnostics_redacts_profile_display_name(self):
+        profile_dir = self.root / "Invalid"
+        profile_dir.mkdir()
+        (profile_dir / "History").write_bytes(b"not-a-sqlite-file")
+        ScannerCore._reset_diagnostics()
+        profile = {
+            "b": "Chrome",
+            "p": "Default（confidential.user@example.com）",
+            "path": str(profile_dir),
+            "type": "C",
+            "source": "测试",
+        }
+        ScannerCore.scan(profile, {}, self.root)
+        diagnostic = ScannerCore.diagnostics_text()
+        self.assertIn("Chrome / Default", diagnostic)
+        self.assertNotIn("confidential.user@example.com", diagnostic)
+
     def test_expired_snapshot_budget_skips_profile_quickly(self):
         database = sqlite3.connect(self.root / "History")
         database.execute("CREATE TABLE urls (url TEXT)")
@@ -221,6 +238,9 @@ class ScannerCoreTests(unittest.TestCase):
             database.close()
         self.assertEqual(len(hits), 2)
         self.assertIn("读取限额", ScannerCore.diagnostics_text())
+
+    def test_release_version_is_1_1_8(self):
+        self.assertEqual(MODULE.APP_VERSION, "1.1.8")
 
     def test_chromium_candidate_layouts_cover_non_stable_channels(self):
         candidates = ScannerCore._chromium_candidate_dirs(self.root)

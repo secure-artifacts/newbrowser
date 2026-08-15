@@ -1,84 +1,39 @@
-# 浏览器痕迹分析 (newbrowser)
+# 浏览器痕迹分析
 
-## 如何发布新版本
+浏览器痕迹分析是一个本地运行的 Windows/macOS 浏览器资料审计工具。它在获得操作者授权的前提下读取浏览历史、下载记录和书签，并依照本地规则库生成审计报告。程序不会上传浏览器数据库或网址数据。
 
-本项目使用 GitHub Actions 自动构建和发布。每次发布新版本只需要创建一个 Git Tag 并推送即可。
+当前稳定发布目标为 **v1.1.8**。本版本重点提升 Windows Chrome 资料发现、活跃 SQLite/WAL 一致性读取、异常 Profile 隔离、诊断隐私和发布供应链稳定性。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-### 发布步骤
+## 使用边界
 
-#### 1. 确保代码已提交并推送
+默认模式只检查当前运行账户的标准浏览器资料目录。扩展兼容搜索会检查同机其他用户目录、固定盘和可移动盘中的浅层便携版痕迹，必须在具有明确授权时使用。软件设计为只读访问浏览器源资料；扫描期间会创建临时 SQLite 快照，任务结束或程序退出时清理。
 
-在发布之前，确保你的所有代码改动已经提交并推送到 GitHub：
+> 诊断文本可用于支持排障，但不应包含浏览器数据库、Cookie、登录数据、书签、真实网址或账号截图。v1.1.8 的复制诊断已移除 Profile 显示名中的账号信息，并将底层异常压缩为类型/错误代码。
 
-```bash
-# 查看当前状态
-git status
+## 发布流程
 
-# 添加所有改动
-git add .
-
-# 提交改动（把"你的改动说明"替换成实际的描述）
-git commit -m "你的改动说明"
-
-# 推送到 GitHub
-git push origin main
-```
-
-#### 2. 创建版本 Tag
-
-Git Tag 是一个版本标记，用于标识发布的版本号。版本号格式为 `v主版本.次版本.修订版本`，例如 `v1.0.0`、`v1.1.0`、`v2.0.0`。
+正式发布由 GitHub Actions 完成。只有严格符合 `vMAJOR.MINOR.PATCH` 格式的 Git tag 才允许进入构建流程；构建前会运行核心回归测试，再生成 Windows、Apple Silicon macOS 和 Intel macOS 的 ZIP 包、构建来源证明与 GitHub Release。
 
 ```bash
-# 创建一个新的版本 tag（将 v1.0.1 替换为你想要的版本号）
-git tag -a v1.0.1 -m "Release version 1.0.1"
+# 1. 在 release/v1.1.8 分支完成审查、测试并合并到 main
+# 2. 仅在 main 对应提交上创建带注释的发布标签
+git tag -a v1.1.8 -m "Release v1.1.8"
+git push origin v1.1.8
 ```
 
-#### 3. 推送 Tag 触发自动构建
+发布完成后，应在 GitHub Release 中核对各资产的名称、平台、下载大小、构建来源证明和 SHA-256。发布失败时不要复用同一标签覆盖已发布资产；应先调查失败原因，再创建新的修复版本标签，例如 `v1.1.9`。
+
+## 本地验证
+
+开发或发布前，请运行：
 
 ```bash
-# 推送 tag 到 GitHub（这会自动触发 CI 构建）
-git push origin v1.0.1
+BROWSER_AUDIT_HEADLESS_TESTS=1 python3 -m py_compile browser_Gui.py tests/test_browser_core.py
+BROWSER_AUDIT_HEADLESS_TESTS=1 python3 -m unittest discover -s tests -v
 ```
 
-推送后，GitHub Actions 会自动执行以下操作：
+Windows 测试包可通过分支专用的 `Build Windows Test Package` 工作流构建；正式版本必须依赖 `Build and Release with Attestation` 工作流发布，禁止手工上传可执行包替代自动化产物。
 
-1. 在 Windows / macOS 多平台上构建可执行文件
-2. 生成安全签名（Attestation）
-3. 创建 Release 并上传构建产物
+## 回滚
 
-#### 4. 查看构建结果
-
-- 构建进度：访问项目的 **Actions** 页面查看
-- 发布结果：访问项目的 **Releases** 页面查看已发布的文件
-
-### 版本号说明
-
-| 版本号格式 | 什么时候用 | 示例 |
-|-----------|-----------|------|
-| `vX.0.0` | 重大更新、不兼容改动 | `v2.0.0` |
-| `vX.Y.0` | 新增功能 | `v1.1.0` |
-| `vX.Y.Z` | 修复 bug | `v1.0.1` |
-
-### 如果构建失败怎么办
-
-1. 访问项目的 **Actions** 页面查看错误日志
-2. 修复代码问题
-3. 删除失败的 tag 并重新创建：
-
-```bash
-# 删除本地 tag
-git tag -d v1.0.1
-
-# 删除远程 tag
-git push origin :refs/tags/v1.0.1
-
-# 修复问题后，重新创建并推送
-git tag -a v1.0.1 -m "Release version 1.0.1"
-git push origin v1.0.1
-```
-
-### 重要提醒
-
-- **禁止**在 GitHub 网页上手动创建 Release 或手动上传 zip 文件
-- 所有产物必须由 `github-actions[bot]` 自动上传，否则安全平台审核会失败
-- 版本 tag 必须以 `v` 开头（如 `v1.0.1`）
+如发现 1.1.8 重大问题，应停止分发对应资产、记录受影响范围，并在 `main` 基于已验证的提交发布递增修复版本。不要删除用户已下载的文件，也不要强制删除历史 Release 或覆盖既有 tag，以保留审计追溯能力。
