@@ -138,9 +138,13 @@ class ScannerCoreTests(unittest.TestCase):
             else:
                 os.environ["LOCALAPPDATA"] = old_local_app_data
 
-        self.assertEqual(len(profiles), 1)
-        self.assertEqual(profiles[0]["b"], "Chrome Dev")
-        self.assertEqual(profiles[0]["p"], "Default")
+        # Windows 托管运行器可能预装 Edge/Chrome 资料；测试只验证重定向的
+        # LOCALAPPDATA 中目标 Profile 被发现，不能假设全机只有一个配置。
+        expected_path = str(profile)
+        matching_profiles = [item for item in profiles if item["path"] == expected_path]
+        self.assertEqual(len(matching_profiles), 1)
+        self.assertEqual(matching_profiles[0]["b"], "Chrome Dev")
+        self.assertEqual(matching_profiles[0]["p"], "Default")
 
     def test_manual_profile_path_is_recognised(self):
         profile = self.root / "Custom Profile"
