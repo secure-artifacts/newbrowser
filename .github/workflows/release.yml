@@ -68,7 +68,16 @@ jobs:
           if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
         if: runner.os != 'Windows'
 
-      - name: Run core regression tests
+      - name: Run core regression tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:BROWSER_AUDIT_HEADLESS_TESTS = "1"
+          python -m unittest discover -s tests -v
+
+      - name: Run core regression tests (macOS)
+        if: runner.os == 'macOS'
         env:
           BROWSER_AUDIT_HEADLESS_TESTS: "1"
         run: python -m unittest discover -s tests -v
