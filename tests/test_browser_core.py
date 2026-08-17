@@ -72,6 +72,24 @@ class ScannerCoreTests(unittest.TestCase):
                 snapshot.unlink(missing_ok=True)
             writer.close()
 
+    def test_direct_read_sees_committed_wal_content_while_writer_is_open(self):
+        database = self.root / "History"
+        writer = sqlite3.connect(database)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE urls (url TEXT)")
+        writer.execute("INSERT INTO urls(url) VALUES (?)", ("https://direct-wal.example.test/",))
+        writer.commit()
+        reader = None
+        try:
+            reader = ScannerCore._open_direct_database(database, time.monotonic() + 2.0)
+            values = reader.execute("SELECT url FROM urls").fetchall()
+            self.assertEqual(values, [("https://direct-wal.example.test/",)])
+        finally:
+            if reader is not None:
+                reader.close()
+            writer.close()
+
     def test_collect_chromium_profiles_uses_local_state_name(self):
         user_data = self.root / "Google" / "Chrome" / "User Data"
         profile = user_data / "Profile 2"
@@ -160,6 +178,18 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(len(profiles), 1)
         self.assertEqual(profiles[0]["p"], "Profile 88（尚未启动）")
 
+    def test_system_profile_without_user_artifacts_is_not_reported(self):
+        user_data = self.root / "User Data"
+        system_profile = user_data / "System Profile"
+        system_profile.mkdir(parents=True)
+        (system_profile / "Preferences").write_text("{}", encoding="utf-8")
+        (user_data / "Local State").write_text(
+            json.dumps({"profile": {"info_cache": {"System Profile": {"name": "System"}}}}),
+            encoding="utf-8",
+        )
+        profiles = ScannerCore._collect_chrome_profiles(user_data, "Chrome", set(), "测试")
+        self.assertEqual(profiles, [])
+
     def test_chromium_download_variants_are_all_scanned(self):
         profile_dir = self.root / "Default"
         profile_dir.mkdir()
@@ -192,6 +222,40 @@ class ScannerCoreTests(unittest.TestCase):
             "https://site.example.test/c",
             "https://chain.example.test/d",
         }.issubset(urls))
+
+    def test_chromium_prefers_direct_read_and_does_not_require_snapshot(self):
+        profile_dir = self.root / "Default"
+        profile_dir.mkdir()
+        database = sqlite3.connect(profile_dir / "History")
+        database.execute("CREATE TABLE urls (url TEXT)")
+        database.execute("INSERT INTO urls(url) VALUES (?)", ("https://direct-read.example.test/record",))
+        database.commit()
+        database.close()
+        source_bytes_before = (profile_dir / "History").read_bytes()
+        profile = {"b": "Chrome", "p": "Default", "path": str(profile_dir), "type": "C", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        with mock.patch.object(ScannerCore, "_snapshot_database", side_effect=AssertionError("snapshot should not run")):
+            hits = ScannerCore.scan(profile, {"direct-read.example.test": "命中"}, self.root)
+        self.assertEqual([hit[4] for hit in hits], ["https://direct-read.example.test/record"])
+        self.assertIn("只读一致性事务读取", ScannerCore.diagnostics_text())
+        self.assertTrue(ScannerCore.scan_is_complete())
+        self.assertEqual((profile_dir / "History").read_bytes(), source_bytes_before)
+
+    def test_direct_read_failure_falls_back_to_online_snapshot(self):
+        profile_dir = self.root / "Default"
+        profile_dir.mkdir()
+        database = sqlite3.connect(profile_dir / "History")
+        database.execute("CREATE TABLE urls (url TEXT)")
+        database.execute("INSERT INTO urls(url) VALUES (?)", ("https://snapshot-fallback.example.test/record",))
+        database.commit()
+        database.close()
+        profile = {"b": "Chrome", "p": "Default", "path": str(profile_dir), "type": "C", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        with mock.patch.object(ScannerCore, "_open_direct_database", side_effect=sqlite3.OperationalError("simulated lock")):
+            hits = ScannerCore.scan(profile, {"snapshot-fallback.example.test": "命中"}, self.root)
+        self.assertEqual([hit[4] for hit in hits], ["https://snapshot-fallback.example.test/record"])
+        self.assertIn("数据库回退", ScannerCore.diagnostics_text())
+        self.assertTrue(ScannerCore.scan_is_complete())
 
     def test_windows_discovery_uses_localappdata_not_login_name(self):
         local_app_data = self.root / "redirected" / "Local"
@@ -243,6 +307,38 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(profiles[0]["source"], "手动选择路径")
         self.assertNotIn("目录不是可识别", ScannerCore.diagnostics_text())
 
+    def test_firefox_bookmarks_are_queried_independently(self):
+        profile_dir = self.root / "firefox.default"
+        profile_dir.mkdir()
+        database = sqlite3.connect(profile_dir / "places.sqlite")
+        database.execute("CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT)")
+        database.execute("CREATE TABLE moz_bookmarks (fk INTEGER, type INTEGER)")
+        database.execute("CREATE TABLE moz_historyvisits (place_id INTEGER)")
+        database.execute("INSERT INTO moz_places(id, url) VALUES (1, ?)", ("https://firefox-bookmark.example.test/",))
+        database.execute("INSERT INTO moz_bookmarks(fk, type) VALUES (1, 1)")
+        database.commit()
+        database.close()
+        profile = {"b": "Firefox", "p": "default", "path": str(profile_dir), "type": "F", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        hits = ScannerCore.scan(profile, {"firefox-bookmark.example.test": "命中"}, self.root)
+        self.assertTrue(any(hit[2] == "浏览器书签" for hit in hits))
+        self.assertFalse(any(hit[2] == "历史记录" for hit in hits))
+        self.assertTrue(ScannerCore.scan_is_complete())
+
+    def test_safari_bookmark_survives_invalid_history_database(self):
+        import plistlib
+
+        profile_dir = self.root / "Safari"
+        profile_dir.mkdir()
+        (profile_dir / "History.db").write_bytes(b"not-a-sqlite-file")
+        with (profile_dir / "Bookmarks.plist").open("wb") as file_handler:
+            plistlib.dump({"Children": [{"URLString": "https://safari-bookmark.example.test/"}]}, file_handler)
+        profile = {"b": "Safari", "p": "MainSystem", "path": str(profile_dir), "type": "S", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        hits = ScannerCore.scan(profile, {"safari-bookmark.example.test": "命中"}, self.root)
+        self.assertTrue(any(hit[2] == "浏览器书签" for hit in hits))
+        self.assertFalse(ScannerCore.scan_is_complete())
+
     def test_invalid_database_is_isolated_from_following_profile(self):
         invalid_profile = self.root / "Invalid"
         invalid_profile.mkdir()
@@ -292,6 +388,22 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertIsNone(snapshot)
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertIn("一致性快照超时", ScannerCore.diagnostics_text())
+
+    def test_direct_query_progress_handler_interrupts_expensive_sql(self):
+        database_path = self.root / "History"
+        database = sqlite3.connect(database_path)
+        database.execute("CREATE TABLE numbers (value INTEGER)")
+        database.executemany("INSERT INTO numbers(value) VALUES (?)", [(index,) for index in range(1000)])
+        database.commit()
+        database.close()
+        reader = ScannerCore._open_direct_database(database_path, time.monotonic() + 0.05)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                reader.execute("SELECT count(*) FROM numbers a, numbers b, numbers c").fetchone()
+        finally:
+            reader.close()
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_url_row_limit_records_diagnostic_without_hanging(self):
         database = sqlite3.connect(self.root / "limit.sqlite")
@@ -351,8 +463,8 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(rules["hailuoai.com"], "AI服务(海螺AI)")
         self.assertEqual(rules["cn"], "专项审计目标")
 
-    def test_release_version_is_1_1_9(self):
-        self.assertEqual(MODULE.APP_VERSION, "1.1.9")
+    def test_release_version_is_1_1_10(self):
+        self.assertEqual(MODULE.APP_VERSION, "1.1.10")
 
     def test_chromium_candidate_layouts_cover_non_stable_channels(self):
         candidates = ScannerCore._chromium_candidate_dirs(self.root)
