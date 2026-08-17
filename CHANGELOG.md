@@ -1,5 +1,22 @@
 # 更新记录
 
+## [1.1.10] - 2026-08-16
+
+### 已修复
+
+| 范畴 | 1.1.10 改进 |
+|---|---|
+| 活动 SQLite/WAL | Chromium、Firefox、Safari 优先建立只读一致性事务，直接读取已提交 WAL；直接读取失败时才回退到 SQLite Online Backup。 |
+| 防卡死 | 数据库打开由 busy timeout 限制，SQL 执行由 SQLite progress handler 中断；直接读取与快照分别有预算，单个异常 Profile 仍不能无限阻塞。 |
+| 书签完整性 | Chromium、Firefox、Safari 均优先扫描书签；历史数据库后续超时、锁定或损坏不会撤销已经得到的书签结果。 |
+| Firefox 精准分类 | 书签通过 `moz_bookmarks` 独立读取；历史仅通过 `moz_historyvisits` 读取，不再把只有书签、没有访问记录的网址误标成历史。 |
+| Profile 准确性 | 没有 History/Bookmarks 的 Chromium `System Profile` 不再作为用户浏览 Profile 显示。 |
+| 诊断 | 明确显示直接只读是否成功，以及何时回退到一致性快照；只有两条路径都失败才标记未完成。 |
+
+### 验证重点
+
+新增回归覆盖活动 WAL 直接读取、直接读取失败后的快照回退、超长 SQL 强制中断、Firefox 书签独立分类、Safari History 损坏时仍保留书签，以及空 System Profile 排除。
+
 ## [1.1.9] - 2026-08-16
 
 ### 已修复

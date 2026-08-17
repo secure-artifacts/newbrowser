@@ -15,7 +15,7 @@ import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import tkinter as tk
@@ -25,14 +25,15 @@ from tkinter import filedialog, messagebox, ttk
 # =================================================
 # 0. 全局配置
 # =================================================
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
 MAX_RULE_COUNT = 250_000
 MAX_MATCHES = 100_000
 # 单个异常 Profile 不能无限占用扫描线程；限制会写入无敏感诊断信息。
-PROFILE_SCAN_BUDGET_SECONDS = 12.0
+PROFILE_SCAN_BUDGET_SECONDS = 20.0
 SESSION_SCAN_BUDGET_SECONDS = 180.0
-SNAPSHOT_BUDGET_SECONDS = 4.0
+DIRECT_READ_BUDGET_SECONDS = 8.0
+SNAPSHOT_BUDGET_SECONDS = 8.0
 MAX_URL_ROWS_PER_TABLE = 100_000
 
 logging.basicConfig(
@@ -381,6 +382,13 @@ class ScannerCore:
         try:
             if not path.is_dir():
                 return False
+            # Chromium 的 System Profile 用于浏览器内部组件，不是用户浏览配置。
+            # 只有它确实留下用户型 History/Bookmarks 时才纳入，避免空壳误报。
+            if path.name.casefold() == "system profile":
+                return any(
+                    (path / marker).is_file()
+                    for marker in ("History", "Bookmarks", "Bookmarks.bak")
+                )
             if indexed_names and path.name in indexed_names:
                 return True
             strong_markers = (
@@ -695,6 +703,129 @@ class ScannerCore:
                 except OSError:
                     pass
 
+    @classmethod
+    def _open_direct_database(
+        cls, db_path: Path, deadline: Optional[float] = None
+    ) -> sqlite3.Connection:
+        """直接建立只读一致性事务；优先读取已提交 WAL，且绝不写源数据库。"""
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            db_uri = db_path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(
+                db_uri,
+                uri=True,
+                timeout=cls._remaining_seconds(deadline),
+            )
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(cls._remaining_seconds(deadline) * 1000)}"
+            )
+
+            def interrupt_expired_query() -> int:
+                return int(deadline is not None and time.monotonic() >= deadline)
+
+            connection.set_progress_handler(interrupt_expired_query, 10_000)
+            connection.execute("BEGIN")
+            return connection
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            raise
+
+    @classmethod
+    def _read_database_resiliently(
+        cls,
+        db_path: Path,
+        temp_dir: Path,
+        profile: Dict[str, str],
+        hits: List[Tuple],
+        reader: Callable[[sqlite3.Connection, Optional[float]], None],
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """先直接只读，失败后才做在线快照；两条路径都受限且互相隔离。"""
+        direct_deadline = time.monotonic() + DIRECT_READ_BUDGET_SECONDS
+        if deadline is not None:
+            direct_deadline = min(direct_deadline, deadline)
+        hit_start = len(hits)
+        direct_connection: Optional[sqlite3.Connection] = None
+        try:
+            direct_connection = cls._open_direct_database(db_path, direct_deadline)
+            reader(direct_connection, direct_deadline)
+            cls._record(
+                "info",
+                "数据库",
+                f"{cls._diagnostic_profile_label(profile)} 的 {db_path.name} 已通过只读一致性事务读取。",
+            )
+            return True
+        except (ScanBudgetExceeded, sqlite3.Error, OSError, ValueError) as exc:
+            del hits[hit_start:]
+            reason = "超时" if time.monotonic() >= direct_deadline else cls._safe_error_summary(exc)
+            cls._record(
+                "info",
+                "数据库回退",
+                f"{cls._diagnostic_profile_label(profile)} 的 {db_path.name} 直接只读未完成（{reason}），正在尝试一致性快照。",
+            )
+        finally:
+            if direct_connection is not None:
+                try:
+                    direct_connection.close()
+                except sqlite3.Error:
+                    pass
+
+        snapshot = cls._snapshot_database(db_path, temp_dir, deadline)
+        if snapshot is None:
+            return False
+        snapshot_connection: Optional[sqlite3.Connection] = None
+        try:
+            snapshot_connection = sqlite3.connect(
+                snapshot.as_uri() + "?mode=ro",
+                uri=True,
+                timeout=cls._remaining_seconds(deadline),
+            )
+            snapshot_connection.execute("PRAGMA query_only = ON")
+            snapshot_connection.execute(
+                f"PRAGMA busy_timeout = {int(cls._remaining_seconds(deadline) * 1000)}"
+            )
+
+            def interrupt_expired_snapshot_query() -> int:
+                return int(deadline is not None and time.monotonic() >= deadline)
+
+            snapshot_connection.set_progress_handler(
+                interrupt_expired_snapshot_query, 10_000
+            )
+            reader(snapshot_connection, deadline)
+            cls._record(
+                "info",
+                "数据库回退",
+                f"{cls._diagnostic_profile_label(profile)} 的 {db_path.name} 已通过一致性快照读取。",
+            )
+            return True
+        except ScanBudgetExceeded:
+            raise
+        except sqlite3.Error as exc:
+            cls._mark_partial(
+                f"{cls._diagnostic_profile_label(profile)} 的 {db_path.name} 读取失败"
+            )
+            cls._record(
+                "error",
+                "数据库",
+                f"{cls._diagnostic_profile_label(profile)} 的 {db_path.name} 读取失败：{cls._safe_error_summary(exc)}",
+            )
+            return False
+        finally:
+            if snapshot_connection is not None:
+                try:
+                    snapshot_connection.close()
+                except sqlite3.Error:
+                    pass
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError as exc:
+                cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
+
 
     @classmethod
     def _collect_explicit_paths(cls, paths: List[Path], seen_paths: Set[str]) -> List[Dict[str, str]]:
@@ -879,6 +1010,27 @@ class ScannerCore:
             pass
 
     @classmethod
+    def _read_chromium_connection(
+        cls,
+        connection: sqlite3.Connection,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        hits: List[Tuple],
+        deadline: Optional[float],
+    ) -> None:
+        cursor = connection.cursor()
+        cls._read_urls(
+            cursor,
+            "SELECT url FROM urls WHERE url IS NOT NULL",
+            profile,
+            "历史记录",
+            rules,
+            hits,
+            deadline,
+        )
+        cls._scan_chromium_downloads(cursor, profile, rules, hits, deadline)
+
+    @classmethod
     def _scan_chromium(
         cls,
         profile: Dict[str, str],
@@ -922,34 +1074,19 @@ class ScannerCore:
             cls._record("info", "数据库", f"{cls._diagnostic_profile_label(profile)} 当前无 History；书签检查已独立完成。")
             return
 
-        snapshot = cls._snapshot_database(history_path, temp_dir, deadline)
-        if snapshot is None:
-            return
-        connection: Optional[sqlite3.Connection] = None
-        try:
-            connection = sqlite3.connect(
-                snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
+        def read_history(connection: sqlite3.Connection, read_deadline: Optional[float]) -> None:
+            cls._read_chromium_connection(
+                connection, profile, rules, hits, read_deadline
             )
-            cursor = connection.cursor()
-            cls._read_urls(
-                cursor, "SELECT url FROM urls WHERE url IS NOT NULL", profile, "历史记录", rules, hits, deadline
-            )
-            cls._scan_chromium_downloads(cursor, profile, rules, hits, deadline)
-        except ScanBudgetExceeded:
-            raise
-        except sqlite3.Error as exc:
-            cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 的 History 读取失败")
-            cls._record("error", "数据库", f"{cls._diagnostic_profile_label(profile)} 读取失败：{cls._safe_error_summary(exc)}")
-        finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except sqlite3.Error:
-                    pass
-            try:
-                snapshot.unlink(missing_ok=True)
-            except OSError as exc:
-                cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
+
+        cls._read_database_resiliently(
+            history_path,
+            temp_dir,
+            profile,
+            hits,
+            read_history,
+            deadline,
+        )
 
     @classmethod
     def _scan_firefox(
@@ -961,17 +1098,36 @@ class ScannerCore:
         deadline: Optional[float] = None,
     ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "places.sqlite", temp_dir, deadline)
-        if snapshot is None:
-            return
-        connection: Optional[sqlite3.Connection] = None
-        try:
-            connection = sqlite3.connect(
-                snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
-            )
+        database_path = profile_path / "places.sqlite"
+
+        def read_places(connection: sqlite3.Connection, read_deadline: Optional[float]) -> None:
             cursor = connection.cursor()
+            # 书签先独立查询，历史记录过大或后续超时也不会漏掉仍存在的书签。
             cls._read_urls(
-                cursor, "SELECT url FROM moz_places WHERE url IS NOT NULL", profile, "历史记录", rules, hits, deadline
+                cursor,
+                """
+                SELECT DISTINCT mp.url FROM moz_bookmarks mb
+                JOIN moz_places mp ON mb.fk = mp.id
+                WHERE mb.type = 1 AND mp.url IS NOT NULL
+                """,
+                profile,
+                "浏览器书签",
+                rules,
+                hits,
+                read_deadline,
+            )
+            cls._read_urls(
+                cursor,
+                """
+                SELECT DISTINCT mp.url FROM moz_places mp
+                JOIN moz_historyvisits mh ON mh.place_id = mp.id
+                WHERE mp.url IS NOT NULL
+                """,
+                profile,
+                "历史记录",
+                rules,
+                hits,
+                read_deadline,
             )
             try:
                 cls._read_urls(
@@ -990,24 +1146,19 @@ class ScannerCore:
                     "下载文件",
                     rules,
                     hits,
-                    deadline,
+                    read_deadline,
                 )
             except sqlite3.Error:
                 pass
-        except ScanBudgetExceeded:
-            raise
-        except sqlite3.Error as exc:
-            cls._record("error", "数据库", f"{cls._diagnostic_profile_label(profile)} 读取失败：{cls._safe_error_summary(exc)}")
-        finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except sqlite3.Error:
-                    pass
-            try:
-                snapshot.unlink(missing_ok=True)
-            except OSError as exc:
-                cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
+
+        cls._read_database_resiliently(
+            database_path,
+            temp_dir,
+            profile,
+            hits,
+            read_places,
+            deadline,
+        )
 
     @classmethod
     def _scan_safari(
@@ -1019,55 +1170,58 @@ class ScannerCore:
         deadline: Optional[float] = None,
     ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "History.db", temp_dir, deadline)
-        if snapshot is not None:
-            connection: Optional[sqlite3.Connection] = None
-            try:
-                connection = sqlite3.connect(
-                    snapshot.as_uri() + "?mode=ro", uri=True, timeout=cls._remaining_seconds(deadline)
-                )
-                cursor = connection.cursor()
-                try:
-                    query = """
-                        SELECT DISTINCT history_items.url FROM history_items
-                        INNER JOIN history_visits ON history_items.id = history_visits.history_item
-                    """
-                    cls._read_urls(cursor, query, profile, "历史记录", rules, hits, deadline)
-                except sqlite3.Error:
-                    cls._read_urls(cursor, "SELECT url FROM history_items", profile, "历史记录", rules, hits, deadline)
-            except sqlite3.Error as exc:
-                cls._record("error", "数据库", f"Safari 读取失败：{cls._safe_error_summary(exc)}")
-            finally:
-                if connection is not None:
-                    try:
-                        connection.close()
-                    except sqlite3.Error:
-                        pass
-                try:
-                    snapshot.unlink(missing_ok=True)
-                except OSError as exc:
-                    cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
-
+        # Safari 书签也是独立数据源，必须先于可能超时的 History.db 读取。
         plist_path = profile_path / "Bookmarks.plist"
         if plist_path.is_file():
             try:
                 with plist_path.open("rb") as file_handler:
                     plist_data = plistlib.load(file_handler)
 
-                def walk(node: object) -> None:
+                pending: List[object] = [plist_data]
+                while pending:
+                    node = pending.pop()
                     if isinstance(node, dict):
                         value = node.get("URLString")
                         if isinstance(value, str):
                             cls._match(value, "浏览器书签", profile, rules, hits)
-                        for value in node.values():
-                            walk(value)
+                        pending.extend(node.values())
                     elif isinstance(node, list):
-                        for child in node:
-                            walk(child)
-
-                walk(plist_data)
+                        pending.extend(node)
             except (OSError, ValueError, TypeError) as exc:
+                cls._mark_partial("Safari Bookmarks.plist 解析失败")
                 cls._record("warning", "书签", f"Safari 书签解析失败：{cls._safe_error_summary(exc)}")
+
+        history_path = profile_path / "History.db"
+        if history_path.is_file():
+            def read_safari_history(
+                connection: sqlite3.Connection, read_deadline: Optional[float]
+            ) -> None:
+                cursor = connection.cursor()
+                try:
+                    query = """
+                        SELECT DISTINCT history_items.url FROM history_items
+                        INNER JOIN history_visits ON history_items.id = history_visits.history_item
+                    """
+                    cls._read_urls(cursor, query, profile, "历史记录", rules, hits, read_deadline)
+                except sqlite3.Error:
+                    cls._read_urls(
+                        cursor,
+                        "SELECT url FROM history_items",
+                        profile,
+                        "历史记录",
+                        rules,
+                        hits,
+                        read_deadline,
+                    )
+
+            cls._read_database_resiliently(
+                history_path,
+                temp_dir,
+                profile,
+                hits,
+                read_safari_history,
+                deadline,
+            )
 
     @classmethod
     def scan(cls, profile: Dict[str, str], rules: Dict[str, str], temp_dir: Path) -> List[Tuple]:
@@ -1159,7 +1313,7 @@ class App(tk.Tk):
         tk.Label(header, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
         tk.Label(
             header,
-            text="v1.1.9：无 History Profile 识别、书签独立扫描与异常隔离",
+            text="v1.1.10：分层只读数据库、书签优先与防卡死隔离",
             font=("Arial", 9),
             fg="#555",
         ).pack(anchor="w", pady=(2, 0))
