@@ -1,4 +1,4 @@
-# 浏览器痕迹分析 v1.1.8-rc：Windows 发布候选验证说明
+# 浏览器痕迹分析 v1.1.9-test1：Windows 验证说明
 
 > **用途**：本测试包用于验证少数 Windows 设备无法识别 Chrome 浏览器资料的问题。该版本不会上传浏览器数据；扫描和报告均在本机完成。请只在您有权限审计的设备上运行。
 
@@ -14,7 +14,8 @@
 | Chrome 非稳定通道 | 使用 Beta / Dev / Canary / Chrome for Testing / Chromium 后直接检测 | 应显示对应浏览器名称与 Profile |
 | Chrome 运行中 | 保持 Chrome 打开后检测 | 应能读取已提交历史；不会要求关闭 Chrome |
 | 多 Profile | 登录多个 Chrome Profile 后检测 | 应列出 Default、Profile N 等多个配置 |
-| 自定义资料目录 | 点击“选择浏览器数据目录”，选择 Chrome 的 `User Data` 或具体 Profile（含 `History` 文件）后开始检测 | 应将该路径识别为手动选择路径 |
+| 无 History Profile | 保留 `Bookmarks` 或 `Preferences`，清理 `History` 后检测 | 仍应识别 Profile 并扫描书签；诊断显示当前无 History |
+| 自定义资料目录 | 点击“选择浏览器数据目录”，选择 Chrome 的 `User Data` 或具体 Profile 后开始检测 | 即使没有 `History`，只要存在可信 Profile 特征也应识别 |
 | 远程/管理员运行 | 仅在已获审计授权时勾选“扩展兼容搜索”再检测 | 应额外检查同机其他 Windows 用户目录和本地/可移动盘的便携版路径 |
 
 ## 二、推荐测试顺序
@@ -45,7 +46,7 @@
 请仅复制以下模板中的非敏感信息；目录中的用户名可替换为 `<USER>`：
 
 ```text
-测试包版本：v1.1.8-rc
+测试包版本：v1.1.9-test1
 Windows 版本：
 程序运行方式：员工双击 / 远程工具 / 管理员 / 其他
 Chrome 通道：稳定版 / Beta / Dev / Canary / Chromium / 不确定
@@ -59,4 +60,4 @@ Chrome 关闭后结果：
 
 ## 五、本版本的主要改动
 
-v1.1.8-rc 保留 Windows Chrome 的环境变量优先发现、多通道定位、WAL 一致性读取和手动目录选择能力，并加入**单配置故障隔离**：某个损坏、无权限或安全描述符异常的 Firefox/Chrome 数据库只会被跳过，不会中断其他浏览器配置。每个 Profile 最多占用 12 秒，整个任务最多运行 180 秒；程序会展示“正在读取（n/总数）”与“已处理（n/总数）”，并把跳过原因写入不含网址的诊断文本。每个表最多读取 100,000 行，以避免异常超大历史库长时间阻塞。
+v1.1.9-test1 保留 Windows Chrome 的环境变量优先发现、多通道定位、WAL 一致性读取、手动目录选择和单配置故障隔离。新增无 History Profile 识别以及书签独立优先扫描：某个 History 损坏、无权限、锁定或超时，不会再阻断同一 Profile 的 Bookmarks/Bookmarks.bak。每个 Profile、整次任务和单表仍有防卡死保护；一旦触发，界面必须显示“部分完成”，不能据此确认没有留痕。诊断文本会说明未完成原因且不包含真实网址。

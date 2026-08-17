@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 # =================================================
 # 0. 全局配置
 # =================================================
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
 MAX_RULE_COUNT = 250_000
 MAX_MATCHES = 100_000
@@ -146,8 +146,23 @@ class ResourceManager:
 
     @staticmethod
     def load_audit_rules() -> Dict[str, str]:
-        rules: Dict[str, str] = {}
+        generic_rules: Dict[str, str] = {}
+        labelled_rules: Dict[str, str] = {}
         server_pattern = re.compile(r"^server=/([^/]+)/")
+
+        def normalise_domain(value: str) -> str:
+            domain = value.strip().lower().rstrip(".")
+            try:
+                domain = domain.encode("idna").decode("ascii")
+            except (UnicodeError, ValueError):
+                return ""
+            labels = domain.split(".")
+            if not domain or len(domain) > 253 or any(
+                not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9-]+", label)
+                for label in labels
+            ):
+                return ""
+            return domain
 
         for rule_file in ResourceManager._candidate_rule_files():
             if not rule_file.exists() or not rule_file.is_file():
@@ -158,7 +173,7 @@ class ResourceManager:
                     continue
                 with rule_file.open("r", encoding="utf-8", errors="ignore") as file_handler:
                     for line in file_handler:
-                        if len(rules) >= MAX_RULE_COUNT:
+                        if len(generic_rules) + len(labelled_rules) >= MAX_RULE_COUNT:
                             logger.warning("规则数量达到上限 %d，停止读取", MAX_RULE_COUNT)
                             break
                         line = line.strip()
@@ -167,17 +182,19 @@ class ResourceManager:
                         if line.startswith("server="):
                             match = server_pattern.match(line)
                             if match:
-                                domain = match.group(1).strip().lower()
-                                if len(domain) >= 4 and "." in domain:
-                                    rules[domain] = "专项审计目标"
+                                domain = normalise_domain(match.group(1))
+                                if domain:
+                                    generic_rules.setdefault(domain, "专项审计目标")
                         elif "=" in line:
                             domain, label = line.split("=", 1)
-                            domain = domain.strip().lower()
-                            if len(domain) >= 4 and "." in domain:
-                                rules[domain] = label.strip()[:120] or "自定义分类"
+                            domain = normalise_domain(domain)
+                            if domain:
+                                labelled_rules[domain] = label.strip()[:120] or "自定义分类"
             except (OSError, UnicodeError) as exc:
                 logger.warning("解析规则文件失败 [%s]：%s", rule_file.name, exc)
 
+        rules = dict(generic_rules)
+        rules.update(labelled_rules)
         for domain, label in DEFAULT_INTERNAL_RULES.items():
             rules.setdefault(domain, label)
         return rules
@@ -253,11 +270,23 @@ class ScannerCore:
     )
     _diagnostics: List[Dict[str, str]] = []
     _diagnostic_lock = threading.Lock()
+    _partial_reasons: Set[str] = set()
 
     @classmethod
     def _reset_diagnostics(cls) -> None:
         with cls._diagnostic_lock:
             cls._diagnostics = []
+            cls._partial_reasons = set()
+
+    @classmethod
+    def _mark_partial(cls, reason: str) -> None:
+        with cls._diagnostic_lock:
+            cls._partial_reasons.add(reason[:200])
+
+    @classmethod
+    def scan_is_complete(cls) -> bool:
+        with cls._diagnostic_lock:
+            return not cls._partial_reasons
 
     @staticmethod
     def _diagnostic_profile_label(profile: Dict[str, str]) -> str:
@@ -341,17 +370,43 @@ class ScannerCore:
             return {
                 str(profile_id): str(info.get("name", "")).strip()
                 for profile_id, info in info_cache.items()
-                if isinstance(info, dict) and str(info.get("name", "")).strip()
+                if isinstance(info, dict)
             }
         except (OSError, ValueError, TypeError):
             return {}
+
+    @staticmethod
+    def _is_chromium_profile_dir(path: Path, indexed_names: Optional[Set[str]] = None) -> bool:
+        """识别真实 Chromium Profile，不再把 History 当成唯一准入条件。"""
+        try:
+            if not path.is_dir():
+                return False
+            if indexed_names and path.name in indexed_names:
+                return True
+            strong_markers = (
+                "Preferences",
+                "Secure Preferences",
+                "Bookmarks",
+                "Bookmarks.bak",
+                "History",
+            )
+            return any((path / marker).is_file() for marker in strong_markers)
+        except (OSError, PermissionError):
+            return False
 
     @staticmethod
     def _is_valid_user_data(path: Path) -> bool:
         if not path.is_dir():
             return False
         try:
-            return any(sub.is_dir() and (sub / "History").is_file() for sub in path.iterdir())
+            profile_names = set(ScannerCore._load_profile_names(path))
+            if (path / "Local State").is_file() and profile_names:
+                return True
+            return any(
+                ScannerCore._is_chromium_profile_dir(sub, profile_names)
+                for sub in path.iterdir()
+                if sub.is_dir()
+            )
         except (OSError, PermissionError):
             return False
 
@@ -363,7 +418,7 @@ class ScannerCore:
         profile_names = cls._load_profile_names(base)
         try:
             for sub in base.iterdir():
-                if not sub.is_dir() or not (sub / "History").is_file():
+                if not cls._is_chromium_profile_dir(sub, set(profile_names)):
                     continue
                 path_key = cls._normalise_path_key(sub)
                 if path_key in seen_paths:
@@ -381,6 +436,7 @@ class ScannerCore:
                     }
                 )
         except (OSError, PermissionError) as exc:
+            cls._mark_partial(f"{browser_name} 配置目录不可枚举")
             cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{cls._safe_error_summary(exc)}")
         return found
 
@@ -401,6 +457,7 @@ class ScannerCore:
                     {"b": browser_name, "p": sub.name, "path": str(sub), "type": "F", "source": source}
                 )
         except (OSError, PermissionError) as exc:
+            cls._mark_partial(f"{browser_name} 配置目录不可枚举")
             cls._record("warning", "发现", f"{browser_name} 配置目录不可枚举：{cls._safe_error_summary(exc)}")
         return found
 
@@ -542,7 +599,7 @@ class ScannerCore:
                                 {"b": "Firefox(外置)", "p": path.name, "path": str(path), "type": "F", "source": "便携目录"}
                             )
                         continue
-                    if (path / "History").is_file():
+                    if cls._is_chromium_profile_dir(path):
                         path_key = cls._normalise_path_key(path)
                         if path_key not in seen_paths:
                             seen_paths.add(path_key)
@@ -614,9 +671,11 @@ class ScannerCore:
             snapshot_ready = True
             return target
         except ScanBudgetExceeded:
-            cls._record("warning", "数据库", f"{db_path.name} 一致性快照超时，已跳过该配置。")
+            cls._mark_partial(f"{db_path.name} 一致性快照超时")
+            cls._record("warning", "数据库", f"{db_path.name} 一致性快照超时，已跳过该数据源并继续其他资料。")
             return None
         except (sqlite3.Error, OSError, ValueError) as exc:
+            cls._mark_partial(f"{db_path.name} 一致性快照失败")
             cls._record("error", "数据库", f"{db_path.name} 一致性快照失败：{cls._safe_error_summary(exc)}")
             return None
         finally:
@@ -647,7 +706,7 @@ class ScannerCore:
                 if not selected.is_dir():
                     cls._record("warning", "手动路径", f"所选目录不存在或不可访问：{selected.name}")
                     continue
-                if (selected / "History").is_file():
+                if cls._is_chromium_profile_dir(selected):
                     path_key = cls._normalise_path_key(selected)
                     if path_key not in seen_paths:
                         seen_paths.add(path_key)
@@ -780,6 +839,7 @@ class ScannerCore:
             "读取限额",
             f"{cls._diagnostic_profile_label(profile)} 的 {info_type} 已读取 {MAX_URL_ROWS_PER_TABLE} 行，超出部分已跳过。",
         )
+        cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 的 {info_type} 达到读取限额")
 
     @staticmethod
     def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> Set[str]:
@@ -828,7 +888,41 @@ class ScannerCore:
         deadline: Optional[float] = None,
     ) -> None:
         profile_path = Path(profile["path"])
-        snapshot = cls._snapshot_database(profile_path / "History", temp_dir, deadline)
+        # 书签与 History 完全解耦，并优先读取。History 缺失、损坏、锁定或超时
+        # 都不能再阻止仍然存在的 Bookmarks/Bookmarks.bak 被审计。
+        for bookmark_name, info_type in (
+            ("Bookmarks", "浏览器书签"),
+            ("Bookmarks.bak", "浏览器书签备份"),
+        ):
+            bookmark_path = profile_path / bookmark_name
+            if not bookmark_path.is_file():
+                continue
+            try:
+                with bookmark_path.open("r", encoding="utf-8", errors="ignore") as file_handler:
+                    data = json.load(file_handler)
+                roots = data.get("roots", {}) if isinstance(data, dict) else {}
+                if isinstance(roots, dict):
+                    pending: List[object] = list(roots.values())
+                    while pending:
+                        node = pending.pop()
+                        if not isinstance(node, dict):
+                            continue
+                        value = node.get("url")
+                        if isinstance(value, str):
+                            cls._match(value, info_type, profile, rules, hits)
+                        children = node.get("children", [])
+                        if isinstance(children, list):
+                            pending.extend(children)
+            except (OSError, ValueError, TypeError) as exc:
+                cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 解析失败")
+                cls._record("warning", "书签", f"{cls._diagnostic_profile_label(profile)} 书签解析失败：{cls._safe_error_summary(exc)}")
+
+        history_path = profile_path / "History"
+        if not history_path.is_file():
+            cls._record("info", "数据库", f"{cls._diagnostic_profile_label(profile)} 当前无 History；书签检查已独立完成。")
+            return
+
+        snapshot = cls._snapshot_database(history_path, temp_dir, deadline)
         if snapshot is None:
             return
         connection: Optional[sqlite3.Connection] = None
@@ -844,6 +938,7 @@ class ScannerCore:
         except ScanBudgetExceeded:
             raise
         except sqlite3.Error as exc:
+            cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 的 History 读取失败")
             cls._record("error", "数据库", f"{cls._diagnostic_profile_label(profile)} 读取失败：{cls._safe_error_summary(exc)}")
         finally:
             if connection is not None:
@@ -855,33 +950,6 @@ class ScannerCore:
                 snapshot.unlink(missing_ok=True)
             except OSError as exc:
                 cls._record("warning", "清理", f"临时数据库清理失败：{cls._safe_error_summary(exc)}")
-
-        if deadline is not None and time.monotonic() >= deadline:
-            raise ScanBudgetExceeded("历史数据库读取后时间预算已耗尽")
-
-        bookmark_path = profile_path / "Bookmarks"
-        if bookmark_path.is_file():
-            try:
-                with bookmark_path.open("r", encoding="utf-8", errors="ignore") as file_handler:
-                    data = json.load(file_handler)
-
-                def walk(node: object) -> None:
-                    if not isinstance(node, dict):
-                        return
-                    value = node.get("url")
-                    if isinstance(value, str):
-                        cls._match(value, "浏览器书签", profile, rules, hits)
-                    children = node.get("children", [])
-                    if isinstance(children, list):
-                        for child in children:
-                            walk(child)
-
-                roots = data.get("roots", {}) if isinstance(data, dict) else {}
-                if isinstance(roots, dict):
-                    for root in roots.values():
-                        walk(root)
-            except (OSError, ValueError, TypeError) as exc:
-                cls._record("warning", "书签", f"{cls._diagnostic_profile_label(profile)} 书签解析失败：{cls._safe_error_summary(exc)}")
 
     @classmethod
     def _scan_firefox(
@@ -1016,11 +1084,14 @@ class ScannerCore:
             elif profile["type"] == "S":
                 cls._scan_safari(profile, rules, temp_dir, hits, deadline)
         except ScanBudgetExceeded:
+            cls._mark_partial(f"{profile_label} 扫描超时")
             cls._record("warning", "扫描限时", f"{profile_label} 超过 {PROFILE_SCAN_BUDGET_SECONDS:.0f} 秒预算，已跳过剩余记录并继续下一个配置。")
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            cls._mark_partial(f"{profile_label} 扫描失败")
             cls._record("error", "配置隔离", f"{profile_label} 已跳过：{cls._safe_error_summary(exc)}")
         except Exception as exc:  # 最后的配置级保护，防止未知格式破坏整批审计。
             logger.exception("Profile 扫描异常：%s", profile_label)
+            cls._mark_partial(f"{profile_label} 出现未预期异常")
             cls._record("error", "配置隔离", f"{profile_label} 出现未预期异常，已跳过：{cls._safe_error_summary(exc)}")
         finally:
             elapsed = time.monotonic() - started_at
@@ -1029,23 +1100,27 @@ class ScannerCore:
 
     @classmethod
     def _match(cls, url: str, info_type: str, profile: Dict[str, str], rules: Dict[str, str], hits: List[Tuple]) -> None:
-        if not url or len(hits) >= MAX_MATCHES or len(url) > 8192:
+        if not url or len(url) > 8192:
+            return
+        if len(hits) >= MAX_MATCHES:
+            cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 达到命中上限")
             return
         try:
             parsed = urlparse(url)
-            domain = (parsed.hostname or "").lower()
+            domain = (parsed.hostname or "").lower().rstrip(".")
             if not domain:
                 return
+            domain = domain.encode("idna").decode("ascii")
             labels = domain.split(".")
             for index in range(len(labels)):
                 if ".".join(labels[index:]) in cls.GLOBAL_WHITE_SET:
                     return
             for index in range(len(labels)):
                 candidate = ".".join(labels[index:])
-                if "." in candidate and candidate in rules:
+                if candidate in rules:
                     hits.append((profile["b"], profile["p"], info_type, rules[candidate], url))
                     return
-        except (ValueError, TypeError):
+        except (UnicodeError, ValueError, TypeError):
             return
 
 
@@ -1070,6 +1145,7 @@ class App(tk.Tk):
         self.selected_paths: List[Path] = []
         self.last_profile_count = 0
         self.last_processed_count = 0
+        self.last_scan_complete = True
 
         ResourceManager.initialize()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -1083,7 +1159,7 @@ class App(tk.Tk):
         tk.Label(header, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
         tk.Label(
             header,
-            text="v1.1.8：多浏览器兼容识别、异常 Profile 隔离与可复制诊断",
+            text="v1.1.9：无 History Profile 识别、书签独立扫描与异常隔离",
             font=("Arial", 9),
             fg="#555",
         ).pack(anchor="w", pady=(2, 0))
@@ -1147,6 +1223,7 @@ class App(tk.Tk):
         self.is_scanning = True
         self.last_profile_count = 0
         self.last_processed_count = 0
+        self.last_scan_complete = True
         include_extended = self.extended_scan_var.get()
         extra_paths = list(self.selected_paths)
         rules = ResourceManager.load_audit_rules()
@@ -1156,7 +1233,7 @@ class App(tk.Tk):
                 profiles = ScannerCore.get_profiles(include_extended=include_extended, extra_paths=extra_paths)
                 self.queue.put(("discovery", len(profiles)))
                 if not profiles:
-                    self.queue.put(("done", []))
+                    self.queue.put(("done", ([], ScannerCore.scan_is_complete())))
                     return
 
                 final_results: List[Tuple] = []
@@ -1167,6 +1244,7 @@ class App(tk.Tk):
                         break
                     if time.monotonic() >= session_deadline:
                         remaining_count = len(profiles) - processed_count
+                        ScannerCore._mark_partial(f"总扫描限时跳过 {remaining_count} 个配置")
                         ScannerCore._record(
                             "warning",
                             "总扫描限时",
@@ -1180,6 +1258,7 @@ class App(tk.Tk):
                     if remaining_hits > 0:
                         final_results.extend(profile_hits[:remaining_hits])
                     if len(final_results) >= MAX_MATCHES:
+                        ScannerCore._mark_partial("达到全局命中上限")
                         ScannerCore._record(
                             "warning",
                             "命中限额",
@@ -1194,7 +1273,8 @@ class App(tk.Tk):
 
                 if self.is_scanning:
                     self.queue.put(("scan_summary", processed_count))
-                    self.queue.put(("done", final_results))
+                    complete = ScannerCore.scan_is_complete() and processed_count == len(profiles)
+                    self.queue.put(("done", (final_results, complete)))
             except Exception as exc:  # 保留最上层保护，完整异常会进入日志与诊断。
                 logger.exception("扫描核心异常")
                 ScannerCore._record("error", "扫描", f"扫描中断：{ScannerCore._safe_error_summary(exc)}")
@@ -1270,7 +1350,7 @@ class App(tk.Tk):
                     self.last_processed_count = int(value)
                 elif message_type == "done":
                     self.btn_run.config(state="normal")
-                    self.all_hits = value
+                    self.all_hits, self.last_scan_complete = value
                     if self.last_profile_count == 0:
                         self.status_lbl.config(text="未识别浏览器配置。请复制诊断信息；必要时在已获授权后勾选“扩展兼容搜索”再试。")
                         messagebox.showwarning(
@@ -1281,10 +1361,17 @@ class App(tk.Tk):
                         )
                     elif self.all_hits:
                         self.execute_instant_report()
-                        self.status_lbl.config(text=f"完成：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，命中 {len(self.all_hits)} 条记录，报告已在浏览器打开。")
+                        prefix = "完整扫描" if self.last_scan_complete else "部分完成"
+                        self.status_lbl.config(text=f"{prefix}：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，命中 {len(self.all_hits)} 条记录，报告已在浏览器打开。")
+                        if not self.last_scan_complete:
+                            messagebox.showwarning("扫描部分完成", "部分数据源因超时、权限、损坏或读取限额未完成。已发现的结果仍已生成报告；请复制诊断信息查看具体原因。")
                     else:
-                        self.status_lbl.config(text=f"扫描完成：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，未发现符合当前规则的留痕。")
-                        messagebox.showinfo("检测结果", f"已处理 {self.last_processed_count}/{self.last_profile_count} 个浏览器配置，但没有匹配到当前规则库中的记录。")
+                        if self.last_scan_complete:
+                            self.status_lbl.config(text=f"完整扫描：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置，未发现符合当前规则的留痕。")
+                            messagebox.showinfo("检测结果", f"已完整处理 {self.last_processed_count}/{self.last_profile_count} 个浏览器配置，但没有匹配到当前规则库中的记录。")
+                        else:
+                            self.status_lbl.config(text=f"部分完成：已处理 {self.last_processed_count}/{self.last_profile_count} 个配置；部分数据源未能读取，不能确认无留痕。")
+                            messagebox.showwarning("扫描部分完成", "部分数据源因超时、权限、损坏或读取限额未完成，因此不能确认没有符合规则的留痕。请复制诊断信息查看具体原因。")
                 elif message_type == "error":
                     self.btn_run.config(state="normal")
                     self.status_lbl.config(text=f"扫描异常中断：{value}。请复制诊断信息反馈。")

@@ -53,6 +53,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Verify source version matches release tag
+        run: python tests/verify_release.py
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -153,14 +156,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      # 诊断日志仅用于失败排障，绝不作为正式 Release 资产。若重建同一版本，
-      # 先删除旧 Release 的整份资产清单，再由下方步骤只上传新构建且已证明的 ZIP。
-      - name: Recreate Release without stale assets
+      # 正式版本不可复用。若同标签 Release 已存在，必须发布递增版本，不能删除后重建。
+      - name: Reject an existing release tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release delete "${GITHUB_REF_NAME}" --yes
+            echo "Release ${GITHUB_REF_NAME} already exists; publish a new version instead." >&2
+            exit 1
           fi
 
       - name: Create Release

@@ -1,5 +1,22 @@
 # 更新记录
 
+## [1.1.9] - 2026-08-16
+
+### 已修复
+
+| 范畴 | 1.1.9 改进 |
+|---|---|
+| 无 History Profile | Profile 发现改为综合使用 Local State 索引、Preferences、Secure Preferences、Bookmarks、Bookmarks.bak 与 History，不再要求 History 必须存在。 |
+| 书签独立扫描 | Chromium 书签优先且独立读取；History 缺失、锁定、损坏或快照超时不再阻断书签和书签备份。 |
+| 防卡死与完整性 | 保留 Profile、快照、整次任务和读取行数保护；触发保护时明确标记“部分完成”，不能再以“完整扫描/无留痕”结束。 |
+| 精准重复扫描 | 每次任务重新发现并读取磁盘资料；删除 History 但保留 Bookmarks 后，重复扫描仍能稳定识别 Profile 和书签命中。 |
+| 规则兼容 | 支持单标签/TLD 规则和 IDNA 规范化；带具体分类的规则优先于重复的通用 server 规则。 |
+| 发布完整性 | 正式版本禁止删除并重建同标签 Release，避免同一版本资产与既有构建证明发生混淆。 |
+
+### 验证重点
+
+新增自动化回归覆盖仅含 Bookmarks 的 Profile、Local State 已登记但 History 尚未初始化的 Profile、损坏 History 与书签隔离、清理 History 后重复扫描、规则优先级及单标签规则。
+
 ## [1.1.8] - 2026-08-14
 
 ### 发布定位
