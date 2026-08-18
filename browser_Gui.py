@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 # =================================================
 # 0. 全局配置
 # =================================================
-APP_VERSION = "1.1.10"
+APP_VERSION = "1.1.11"
 MAX_RULE_FILE_BYTES = 10 * 1024 * 1024
 MAX_RULE_COUNT = 250_000
 MAX_MATCHES = 100_000
@@ -35,6 +35,23 @@ SESSION_SCAN_BUDGET_SECONDS = 180.0
 DIRECT_READ_BUDGET_SECONDS = 8.0
 SNAPSHOT_BUDGET_SECONDS = 8.0
 MAX_URL_ROWS_PER_TABLE = 100_000
+MAX_BOOKMARK_FILE_BYTES = 64 * 1024 * 1024
+BOOKMARK_READ_ATTEMPTS = 3
+BOOKMARK_FLUSH_GRACE_SECONDS = 3.0
+
+CHROMIUM_BOOKMARK_FILES: Tuple[Tuple[str, str], ...] = (
+    ("Bookmarks", "当前有效书签"),
+    ("AccountBookmarks", "账号当前有效书签"),
+    ("Bookmarks.bak", "书签备份残留"),
+    ("AccountBookmarks.bak", "账号书签备份残留"),
+)
+
+CHROMIUM_ENCRYPTED_BOOKMARK_FILES: Tuple[Tuple[str, str], ...] = (
+    ("EncryptedBookmarks2", "Bookmarks"),
+    ("EncryptedAccountBookmarks2", "AccountBookmarks"),
+    ("EncryptedBookmarks", "Bookmarks"),
+    ("EncryptedAccountBookmarks", "AccountBookmarks"),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -387,7 +404,11 @@ class ScannerCore:
             if path.name.casefold() == "system profile":
                 return any(
                     (path / marker).is_file()
-                    for marker in ("History", "Bookmarks", "Bookmarks.bak")
+                    for marker in (
+                        "History",
+                        *(name for name, _ in CHROMIUM_BOOKMARK_FILES),
+                        *(name for name, _ in CHROMIUM_ENCRYPTED_BOOKMARK_FILES),
+                    )
                 )
             if indexed_names and path.name in indexed_names:
                 return True
@@ -396,6 +417,12 @@ class ScannerCore:
                 "Secure Preferences",
                 "Bookmarks",
                 "Bookmarks.bak",
+                "AccountBookmarks",
+                "AccountBookmarks.bak",
+                "EncryptedBookmarks2",
+                "EncryptedAccountBookmarks2",
+                "EncryptedBookmarks",
+                "EncryptedAccountBookmarks",
                 "History",
             )
             return any((path / marker).is_file() for marker in strong_markers)
@@ -1031,6 +1058,92 @@ class ScannerCore:
         cls._scan_chromium_downloads(cursor, profile, rules, hits, deadline)
 
     @classmethod
+    def _load_stable_bookmark_json(cls, bookmark_path: Path) -> object:
+        """读取 Chrome 原子替换中的书签文件；变化或短暂解析失败时有限重试。"""
+        last_error: Optional[BaseException] = None
+        for attempt in range(BOOKMARK_READ_ATTEMPTS):
+            try:
+                before = bookmark_path.stat()
+                if before.st_size > MAX_BOOKMARK_FILE_BYTES:
+                    raise ValueError("bookmark file exceeds safety limit")
+                payload = bookmark_path.read_bytes()
+                after = bookmark_path.stat()
+                before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                if before_signature != after_signature or len(payload) != after.st_size:
+                    raise OSError("bookmark file changed while being read")
+                return json.loads(payload)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt + 1 < BOOKMARK_READ_ATTEMPTS:
+                    time.sleep(0.05 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        raise ValueError("bookmark file could not be read")
+
+    @classmethod
+    def _scan_chromium_bookmarks(
+        cls,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        hits: List[Tuple],
+    ) -> None:
+        profile_path = Path(profile["path"])
+
+        # Chromium 新版可将登录账号书签单独保存在 AccountBookmarks。
+        # 若只剩加密文件，当前版本无法安全解密，必须明确标记部分完成而不能静默漏报。
+        for encrypted_name, clear_name in CHROMIUM_ENCRYPTED_BOOKMARK_FILES:
+            encrypted_path = profile_path / encrypted_name
+            if encrypted_path.is_file() and not (profile_path / clear_name).is_file():
+                cls._mark_partial(
+                    f"{cls._diagnostic_profile_label(profile)} 仅存在加密书签 {encrypted_name}"
+                )
+                cls._record(
+                    "warning",
+                    "加密书签",
+                    f"{cls._diagnostic_profile_label(profile)} 仅存在 {encrypted_name}，无法从明文书签文件完成审计。",
+                )
+
+        for bookmark_name, info_type in CHROMIUM_BOOKMARK_FILES:
+            bookmark_path = profile_path / bookmark_name
+            if not bookmark_path.is_file():
+                continue
+            hit_start = len(hits)
+            try:
+                data = cls._load_stable_bookmark_json(bookmark_path)
+                pending: List[object] = [data]
+                url_count = 0
+                while pending:
+                    node = pending.pop()
+                    if isinstance(node, dict):
+                        value = node.get("url")
+                        if isinstance(value, str):
+                            url_count += 1
+                            cls._match(value, info_type, profile, rules, hits)
+                        pending.extend(
+                            child for key, child in node.items() if key != "url"
+                        )
+                    elif isinstance(node, list):
+                        pending.extend(node)
+
+                match_count = len(hits) - hit_start
+                if bookmark_name != "Bookmarks" or match_count:
+                    cls._record(
+                        "info",
+                        "书签",
+                        f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 已读取 {url_count} 个网址，命中 {match_count} 条。",
+                    )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                cls._mark_partial(
+                    f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 解析失败"
+                )
+                cls._record(
+                    "warning",
+                    "书签",
+                    f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 经过 {BOOKMARK_READ_ATTEMPTS} 次稳定读取仍失败：{cls._safe_error_summary(exc)}",
+                )
+
+    @classmethod
     def _scan_chromium(
         cls,
         profile: Dict[str, str],
@@ -1040,34 +1153,8 @@ class ScannerCore:
         deadline: Optional[float] = None,
     ) -> None:
         profile_path = Path(profile["path"])
-        # 书签与 History 完全解耦，并优先读取。History 缺失、损坏、锁定或超时
-        # 都不能再阻止仍然存在的 Bookmarks/Bookmarks.bak 被审计。
-        for bookmark_name, info_type in (
-            ("Bookmarks", "浏览器书签"),
-            ("Bookmarks.bak", "浏览器书签备份"),
-        ):
-            bookmark_path = profile_path / bookmark_name
-            if not bookmark_path.is_file():
-                continue
-            try:
-                with bookmark_path.open("r", encoding="utf-8", errors="ignore") as file_handler:
-                    data = json.load(file_handler)
-                roots = data.get("roots", {}) if isinstance(data, dict) else {}
-                if isinstance(roots, dict):
-                    pending: List[object] = list(roots.values())
-                    while pending:
-                        node = pending.pop()
-                        if not isinstance(node, dict):
-                            continue
-                        value = node.get("url")
-                        if isinstance(value, str):
-                            cls._match(value, info_type, profile, rules, hits)
-                        children = node.get("children", [])
-                        if isinstance(children, list):
-                            pending.extend(children)
-            except (OSError, ValueError, TypeError) as exc:
-                cls._mark_partial(f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 解析失败")
-                cls._record("warning", "书签", f"{cls._diagnostic_profile_label(profile)} 书签解析失败：{cls._safe_error_summary(exc)}")
+        # 书签与 History 完全解耦并优先读取，History 故障不能阻断任何书签存储。
+        cls._scan_chromium_bookmarks(profile, rules, hits)
 
         history_path = profile_path / "History"
         if not history_path.is_file():
@@ -1313,7 +1400,7 @@ class App(tk.Tk):
         tk.Label(header, text="浏览器痕迹分析", font=("Arial", 14, "bold")).pack(anchor="w")
         tk.Label(
             header,
-            text="v1.1.10：分层只读数据库、书签优先与防卡死隔离",
+            text="v1.1.11：账号书签完整识别、稳定重读与数据库隔离",
             font=("Arial", 9),
             fg="#555",
         ).pack(anchor="w", pady=(2, 0))
@@ -1384,7 +1471,26 @@ class App(tk.Tk):
 
         def task() -> None:
             try:
+                running_browsers = ResourceManager.is_browser_running()
+                if any(
+                    browser in running_browsers
+                    for browser in ("chrome", "msedge", "brave", "360se", "360chrome")
+                ):
+                    self.queue.put(("msg", "浏览器正在运行：等待已保存书签稳定写入磁盘。"))
+                    grace_deadline = time.monotonic() + BOOKMARK_FLUSH_GRACE_SECONDS
+                    while self.is_scanning and time.monotonic() < grace_deadline:
+                        time.sleep(0.1)
+
                 profiles = ScannerCore.get_profiles(include_extended=include_extended, extra_paths=extra_paths)
+                if any(
+                    browser in running_browsers
+                    for browser in ("chrome", "msedge", "brave", "360se", "360chrome")
+                ):
+                    ScannerCore._record(
+                        "info",
+                        "书签",
+                        f"检测到运行中的 Chromium 浏览器，已等待 {BOOKMARK_FLUSH_GRACE_SECONDS:.0f} 秒再读取书签。",
+                    )
                 self.queue.put(("discovery", len(profiles)))
                 if not profiles:
                     self.queue.put(("done", ([], ScannerCore.scan_is_complete())))

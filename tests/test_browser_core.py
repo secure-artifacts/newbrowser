@@ -131,6 +131,114 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual([hit[4] for hit in hits], ["https://mailum.com/bookmark"])
         self.assertTrue(ScannerCore.scan_is_complete())
 
+    def test_account_bookmarks_profile_is_discovered_and_scanned(self):
+        user_data = self.root / "Google" / "Chrome" / "User Data"
+        profile_dir = user_data / "Profile 1"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "AccountBookmarks").write_text(
+            json.dumps(
+                {
+                    "roots": {
+                        "bookmark_bar": {
+                            "type": "folder",
+                            "children": [
+                                {"type": "url", "url": "https://www.mailum.com/account"}
+                            ],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        profiles = ScannerCore._collect_chrome_profiles(user_data, "Chrome", set(), "测试")
+        self.assertEqual(len(profiles), 1)
+        ScannerCore._reset_diagnostics()
+        hits = ScannerCore.scan(profiles[0], {"mailum.com": "命中"}, self.root)
+        self.assertEqual([hit[4] for hit in hits], ["https://www.mailum.com/account"])
+        self.assertEqual(hits[0][2], "账号当前有效书签")
+        self.assertIn("AccountBookmarks 已读取", ScannerCore.diagnostics_text())
+        self.assertTrue(ScannerCore.scan_is_complete())
+
+    def test_local_and_account_bookmark_structures_are_both_scanned(self):
+        profile_dir = self.root / "Profile 276"
+        profile_dir.mkdir()
+        (profile_dir / "Bookmarks").write_text(
+            json.dumps({"roots": {"other": {"url": "https://local.example.test/"}}}),
+            encoding="utf-8",
+        )
+        (profile_dir / "AccountBookmarks").write_text(
+            json.dumps({"account_roots": {"custom": {"url": "https://account.example.test/"}}}),
+            encoding="utf-8",
+        )
+        profile = {"b": "Chrome", "p": "Profile 276", "path": str(profile_dir), "type": "C", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        hits = ScannerCore.scan(
+            profile,
+            {"local.example.test": "本地", "account.example.test": "账号"},
+            self.root,
+        )
+        self.assertEqual(
+            {(hit[2], hit[4]) for hit in hits},
+            {
+                ("当前有效书签", "https://local.example.test/"),
+                ("账号当前有效书签", "https://account.example.test/"),
+            },
+        )
+
+    def test_bookmark_atomic_replacement_is_retried(self):
+        profile_dir = self.root / "Profile 1"
+        profile_dir.mkdir()
+        bookmark_path = profile_dir / "AccountBookmarks"
+        content = json.dumps({"roots": {"other": {"url": "https://retry.example.test/"}}}).encode()
+        bookmark_path.write_bytes(content)
+        profile = {"b": "Chrome", "p": "Profile 1", "path": str(profile_dir), "type": "C", "source": "测试"}
+        ScannerCore._reset_diagnostics()
+        with mock.patch.object(Path, "read_bytes", side_effect=[b"{", content]):
+            hits = ScannerCore.scan(profile, {"retry.example.test": "命中"}, self.root)
+        self.assertEqual([hit[4] for hit in hits], ["https://retry.example.test/"])
+        self.assertTrue(ScannerCore.scan_is_complete())
+
+    def test_encrypted_account_bookmarks_without_cleartext_are_not_silently_complete(self):
+        user_data = self.root / "User Data"
+        profile_dir = user_data / "Profile 1"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "EncryptedAccountBookmarks2").write_bytes(b"encrypted")
+        profiles = ScannerCore._collect_chrome_profiles(user_data, "Chrome", set(), "测试")
+        self.assertEqual(len(profiles), 1)
+        ScannerCore._reset_diagnostics()
+        hits = ScannerCore.scan(profiles[0], {"mailum.com": "命中"}, self.root)
+        self.assertEqual(hits, [])
+        self.assertFalse(ScannerCore.scan_is_complete())
+        self.assertIn("加密书签", ScannerCore.diagnostics_text())
+
+    def test_deleted_account_bookmark_is_only_reported_as_backup_residual_then_clears(self):
+        profile_dir = self.root / "Profile 1"
+        profile_dir.mkdir()
+        (profile_dir / "AccountBookmarks").write_text(
+            json.dumps({"roots": {"bookmark_bar": {"children": []}}}),
+            encoding="utf-8",
+        )
+        backup_path = profile_dir / "AccountBookmarks.bak"
+        backup_path.write_text(
+            json.dumps(
+                {"roots": {"bookmark_bar": {"url": "https://www.mailum.com/deleted"}}}
+            ),
+            encoding="utf-8",
+        )
+        profile = {"b": "Chrome", "p": "Profile 1", "path": str(profile_dir), "type": "C", "source": "测试"}
+
+        ScannerCore._reset_diagnostics()
+        first_hits = ScannerCore.scan(profile, {"mailum.com": "命中"}, self.root)
+        self.assertEqual(len(first_hits), 1)
+        self.assertEqual(first_hits[0][2], "账号书签备份残留")
+
+        backup_path.unlink()
+        ScannerCore._reset_diagnostics()
+        second_hits = ScannerCore.scan(profile, {"mailum.com": "命中"}, self.root)
+        self.assertEqual(second_hits, [])
+        self.assertTrue(ScannerCore.scan_is_complete())
+
     def test_invalid_history_does_not_block_bookmarks(self):
         profile_dir = self.root / "Default"
         profile_dir.mkdir()
@@ -463,8 +571,8 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(rules["hailuoai.com"], "AI服务(海螺AI)")
         self.assertEqual(rules["cn"], "专项审计目标")
 
-    def test_release_version_is_1_1_10(self):
-        self.assertEqual(MODULE.APP_VERSION, "1.1.10")
+    def test_release_version_is_1_1_11(self):
+        self.assertEqual(MODULE.APP_VERSION, "1.1.11")
 
     def test_chromium_candidate_layouts_cover_non_stable_channels(self):
         candidates = ScannerCore._chromium_candidate_dirs(self.root)
