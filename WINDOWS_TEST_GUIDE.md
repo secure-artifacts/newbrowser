@@ -1,4 +1,4 @@
-# 浏览器痕迹分析 v1.1.10-test1：Windows 验证说明
+# 浏览器痕迹分析 v1.1.11-test1：Windows 验证说明
 
 > **用途**：本测试包用于验证少数 Windows 设备无法识别 Chrome 浏览器资料的问题。该版本不会上传浏览器数据；扫描和报告均在本机完成。请只在您有权限审计的设备上运行。
 
@@ -15,6 +15,7 @@
 | Chrome 运行中 | 保持 Chrome 打开后检测 | 应能读取已提交历史；不会要求关闭 Chrome |
 | 多 Profile | 登录多个 Chrome Profile 后检测 | 应列出 Default、Profile N 等多个配置 |
 | 无 History Profile | 保留 `Bookmarks` 或 `Preferences`，清理 `History` 后检测 | 仍应识别 Profile 并扫描书签；诊断显示当前无 History |
+| 登录账号书签 | 在登录账号的 Profile 中保存规则网址并确认出现在书签管理器后立即检测 | 运行中的浏览器先等待 3 秒落盘；随后应以“账号当前有效书签”命中，并在诊断显示读取 `AccountBookmarks` |
 | 自定义资料目录 | 点击“选择浏览器数据目录”，选择 Chrome 的 `User Data` 或具体 Profile 后开始检测 | 即使没有 `History`，只要存在可信 Profile 特征也应识别 |
 | 远程/管理员运行 | 仅在已获审计授权时勾选“扩展兼容搜索”再检测 | 应额外检查同机其他 Windows 用户目录和本地/可移动盘的便携版路径 |
 
@@ -46,7 +47,7 @@
 请仅复制以下模板中的非敏感信息；目录中的用户名可替换为 `<USER>`：
 
 ```text
-测试包版本：v1.1.10-test1
+测试包版本：v1.1.11-test1
 Windows 版本：
 程序运行方式：员工双击 / 远程工具 / 管理员 / 其他
 Chrome 通道：稳定版 / Beta / Dev / Canary / Chromium / 不确定
@@ -60,4 +61,4 @@ Chrome 关闭后结果：
 
 ## 五、本版本的主要改动
 
-v1.1.10-test1 保留无 History Profile 识别、书签独立优先扫描和单配置故障隔离。SQLite 数据库现在优先使用受限时的只读一致性事务读取活动 WAL，失败后才执行 Online Backup；打开、SQL 查询、快照、单 Profile、整次任务和单表均有防卡死保护。只有直接读取和快照都失败时才标记“部分完成”。诊断文本会说明实际使用的读取路径且不包含真实网址。
+v1.1.11-test1 在原有无 History Profile、分层 SQLite/WAL 读取和故障隔离基础上，补齐 `AccountBookmarks` 账号书签、账号备份残留和书签文件稳定重读。诊断会说明实际读取的账号书签文件、网址数量和命中数量，但不包含真实网址。

@@ -2,7 +2,7 @@
 
 浏览器痕迹分析是一个本地运行的 Windows/macOS 浏览器资料审计工具。它在获得操作者授权的前提下读取浏览历史、下载记录和书签，并依照本地规则库生成审计报告。程序不会上传浏览器数据库或网址数据。
 
-当前发布目标为 **v1.1.10**。本版本采用“只读一致性事务优先、在线快照回退”的分层数据库读取，在保留防卡死保护的同时减少活动浏览器 History 快照超时。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前发布目标为 **v1.1.11**。本版本补齐 Chromium `AccountBookmarks` 账号书签存储，并对书签文件原子替换进行稳定重读；同时保留分层数据库读取与防卡死隔离。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 使用边界
 
@@ -15,10 +15,10 @@
 正式发布由 GitHub Actions 完成。只有严格符合 `vMAJOR.MINOR.PATCH` 格式的 Git tag 才允许进入构建流程；构建前会运行核心回归测试，再生成 Windows、Apple Silicon macOS 和 Intel macOS 的 ZIP 包、构建来源证明与 GitHub Release。
 
 ```bash
-# 1. 在 release/v1.1.10 分支完成审查、测试并合并到 main
+# 1. 在 release/v1.1.11 分支完成审查、测试并合并到 main
 # 2. 仅在 main 对应提交上创建带注释的发布标签
-git tag -a v1.1.10 -m "Release v1.1.10"
-git push origin v1.1.10
+git tag -a v1.1.11 -m "Release v1.1.11"
+git push origin v1.1.11
 ```
 
 发布完成后，应在 GitHub Release 中核对各资产的名称、平台、下载大小、构建来源证明和 SHA-256。发布失败时不要复用同一标签覆盖已发布资产；应先调查失败原因，再创建新的递增修复版本标签。
@@ -36,4 +36,4 @@ Windows 测试包可通过分支专用的 `Build Windows Test Package` 工作流
 
 ## 回滚
 
-如发现 1.1.10 重大问题，应停止分发对应资产、记录受影响范围，并在 `main` 基于已验证的提交发布递增修复版本。不要删除用户已下载的文件，也不要强制删除历史 Release 或覆盖既有 tag，以保留审计追溯能力。
+如发现 1.1.11 重大问题，应停止分发对应资产、记录受影响范围，并在 `main` 基于已验证的提交发布递增修复版本。不要删除用户已下载的文件，也不要强制删除历史 Release 或覆盖既有 tag，以保留审计追溯能力。

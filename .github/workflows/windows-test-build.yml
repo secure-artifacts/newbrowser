@@ -1,11 +1,11 @@
-name: Build v1.1.10 Test Packages
+name: Build Test Packages
 
 on:
   push:
     branches:
       - main
       - fix/windows-chrome-compat-v1.2.0-test
-      - release/v1.1.10
+      - release/v1.1.11
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           pyinstaller -F -w browser_Gui.py --name BrowserAudit --clean --noconfirm
-          $packageName = "浏览器痕迹分析-v1.1.10-test1-Windows-x64"
+          $packageName = "浏览器痕迹分析-v1.1.11-test1-Windows-x64"
           $stage = "package/$packageName"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "dist/BrowserAudit.exe" "$stage/浏览器痕迹分析.exe" -Force
@@ -55,7 +55,7 @@ jobs:
       - name: Upload Windows test package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: 浏览器痕迹分析-v1.1.10-test1-Windows-x64
+          name: 浏览器痕迹分析-v1.1.11-test1-Windows-x64
           path: package/*.zip
           if-no-files-found: error
           retention-days: 14
